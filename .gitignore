@@ -1,0 +1,11 @@
+.env
+.venv
+.vscode
+__pycache__/
+data/patient_content/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# Python
+*.pyc

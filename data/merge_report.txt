@@ -1,0 +1,25 @@
+==================================================
+📊  MERGE REPORT - 2026-02-12 21:12:30
+==================================================
+📂 Input: '..\data\patient_content'
+📂 Output: '..\data'
+
+✅ Reference Schema Established from: 165507/session_fe89bd6ae0bfcd70.csv
+   Columns: ['Unnamed: 0', 'nbi', 'location', 'size', 'nice', 'jnet', 'kudo', 'paris', 'assumed histology', 'flask id']
+
+⚠️  Skipping empty file: 5541805/session_6e6868605a45e134.csv
+⚠️  Skipping empty file: 769780/session_d2dd3ca5dd696917.csv
+
+==================================================
+📝  DETAILED ANALYSIS
+==================================================
+❌ FOUND 1 FILES WITH SCHEMA MISMATCH:
+  - File: 70472575/session_ca03b1e440d5b383.csv
+    └── Missing Cols: ['flask id', 'size', 'location', 'assumed histology', 'paris', 'kudo', 'Unnamed: 0', 'jnet', 'nice', 'nbi']
+    └── Extra Cols:   [';nbi;location;size;nice;jnet;kudo;paris;assumed histology;flask id;;']
+
+
+🚫 CORRUPT FILES (3):
+  - 426479/session_9ff8bbbe28a4b7bf.csv: No columns to parse from file
+  - 70137540/session_f9f391768b7d5d4f.csv: No columns to parse from file
+  - 70162069/session_6f277be854c603ab.csv: No columns to parse from file
