@@ -6,6 +6,7 @@ Borrador del índice:
       
       Creación del Dataset Mejorado (El Pipeline):
          Extraer más imágenes de los vídeos usando la posición temporal.
+         importante mirar image matching si son exactamente iguales metemos ruido en el modelo. // phash
          Limpiar las imágenes extraídas:
             Quitar las que se vean negras.
             Quitar las que estén borrosas.
@@ -32,10 +33,16 @@ Lista de Dudas:
  
  2. Teniendo en cuenta el gran desbalanceo del dataset y la naturaleza del proyecto, ¿Cómo puedo elegir una buena métrica para evaluar el modelo? Entiendo que por la naturaleza del proyecto, debo perjudicar mucho los errores.
 
- 3. ¿Sería buena idea trabajar con los vídeos a 1-2fps, para evitar carga computacional e imagenes repetitivas? (Videos: 1920x1080 30fps)
+ 3. ¿Sería buena idea trabajar con los vídeos a 1-2fps, para evitar carga computacional e imagenes repetitivas? (Videos: 1920x1080 30fps) 5 fps 
 
  4. ¿Todos los vídeos provienen de la misma cámara? (Misma resolución y fps)
 
  5. ¿Cómo puedo saber en que instante del vídeo se ha tomado la foto proporcionada por los médicos? Creo que el nombre del vídeo contiene la hora de inicio de la inspección y las imagenes la hora de la captura, así podemos saber el tiempo que ha pasado.
 
 
+# Polip pibabd
+
+
+intro - problema - DataCentric - 3/4 columnas
+
+state of art - intruduccion 0,5 cols, polipos 1col (clasificacion y tiempo real), data-centric 1 col, image quality/tracking 
