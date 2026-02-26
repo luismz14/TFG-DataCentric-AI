@@ -1,0 +1,15 @@
+¿Qué tipo de arquitectura de modelo conviene usar?
+ResNet-50 - Equilibrado
+
+DenseNet - Mejor resultado pero más carga computacional
+
+EfficientNet - Menos carga computacional pero menos precisión
+
+¿Cómo consigo más imagenes valiosas?
+Matching Clásico (ORB - más rápido, hamming distance/SIFT - más lento, preciso ante rotaciones) - Buen resultado, poco coste computacional
+
+Red neuronal Visual Object Tracking, resultado infalible pero implica usar un modelo de detección de pólipos (existente o nuevo)
+
+Respecto a lo que me comentaste del etiquetaje de las imagenes, para hacer la división del train/validation, que tenia que tener en cuenta para hacerlo?
+
+WeightedRandomSampler es buena práctica en casos como este?
