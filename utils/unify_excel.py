@@ -26,9 +26,9 @@ def merge_csv_datasets(input_folder="data", output_folder="results"):
 
     # Cabecera del reporte
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    log(f"==================================================")
+    log("==================================================")
     log(f"📊  MERGE REPORT - {timestamp}")
-    log(f"==================================================")
+    log("==================================================")
     log(f"📂 Input: '{input_folder}'")
     log(f"📂 Output: '{output_folder}'\n")
 
@@ -95,8 +95,10 @@ def merge_csv_datasets(input_folder="data", output_folder="results"):
         log(f"❌ FOUND {len(mismatched_files)} FILES WITH SCHEMA MISMATCH:")
         for error in mismatched_files:
             log(f"  - File: {error['file']}")
-            if error['missing']: log(f"    └── Missing Cols: {error['missing']}")
-            if error['extra']:   log(f"    └── Extra Cols:   {error['extra']}")
+            if error['missing']: 
+                log(f"    └── Missing Cols: {error['missing']}")
+            if error['extra']:   
+                log(f"    └── Extra Cols:   {error['extra']}")
             log("") # Línea en blanco para separar
     else:
         log("✅ All processed files match the reference schema!")

@@ -1,11 +1,35 @@
+# Entorno y configuración
 .env
 .venv
 .vscode
+.DS_Store
+
+# Python
 __pycache__/
-data/patient_content/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.pytest_cache/
 
 # Jupyter Notebook
 .ipynb_checkpoints/
 
-# Python
-*.pyc
+# Datos y reportes
+data/patient_content/
+
+# Salida de LaTeX y compilaciones
+files/latexInformeFinal/%OUTDIR%/
+files/latexInformeFinal/*.pdf
+files/latexInformeFinal/*.aux
+files/latexInformeFinal/*.out
+files/latexInformeFinal/*.toc
+files/latexInformeFinal/*.log
+files/latexInformeFinal/*.synctex.gz
+
+# Archivos específicos
+utils/Informe_final_ejemplo.pdf
+
+# Logs
+*.log
