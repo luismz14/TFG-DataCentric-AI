@@ -3,13 +3,25 @@ ResNet-50 - Equilibrado
 
 DenseNet - Mejor resultado pero más carga computacional
 
-EfficientNet - Menos carga computacional pero menos precisión
+EfficientNet - Menos carga computacional pero menos precisión - Usar esta, modelo más pequeño para tener resultado "tamaño b0".
 
 ¿Cómo consigo más imagenes valiosas?
-Matching Clásico (ORB - más rápido, hamming distance/SIFT - más lento, preciso ante rotaciones) - Buen resultado, poco coste computacional
+Matching Clásico (ORB - más rápido, hamming distance/SIFT - más lento, preciso ante rotaciones) - Buen resultado, poco coste computacional 
 
-Red neuronal Visual Object Tracking, resultado infalible pero implica usar un modelo de detección de pólipos (existente o nuevo)
+Red neuronal Visual Object Tracking, resultado infalible pero implica usar un modelo de detección de pólipos (existente o nuevo) - Este mejor, buscar arquitectura, buscar comodidad.
 
 Respecto a lo que me comentaste del etiquetaje de las imagenes, para hacer la división del train/validation, que tenia que tener en cuenta para hacerlo?
-
+patientid, dia, r y f
 WeightedRandomSampler es buena práctica en casos como este?
+
+
+
+Citas estudio médico histologia.
+
+Añadir en el ultimo párrafo que es necesario que los datos sean homogeneos a partir de los datos de los médicos para que sea un experimento replicable.
+
+Definir algoritmo secuencial para limpiar las imágenes, definición en el objetivo que como se hará, en detalle en metodologia. 
+
+Matizar como elegiré que imagen tiene mejor calidad para entrenar el modelo. Buscar como se hace esto.
+
+Tener baseline, tener fase 2 y fase 3 (esqueleto), para ver que retocar. 

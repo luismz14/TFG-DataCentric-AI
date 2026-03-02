@@ -148,13 +148,14 @@ Sin embargo, la mayoría de los estudios médicos que intentan mitigar el desbal
 \subsection{Fase 1: Entrenamiento del modelo baseline}
 Usar modelo ResNet, EfficientNet o DenseNet preentrenado, fijando hiperparámetros a usar en el resto del proceso.
 \subsection{Fase 2: Ingestión de imágenes a partir de vídeo}
-Conseguir imágenes a partir de los vídeos de las exploraciones, utilizando técnicas de matching clásico o Visual Object Tracking para evitar redundancias. Importante el hecho de ser más restrictivo con clases mayoritarias para reducir el desbalanceo.
+Conseguir imágenes a partir de los vídeos de las exploraciones, utilizando técnicas de matching clásico o Visual Object Tracking para evitar redundancias. Importante el hecho de ser más restrictivo con clases mayoritarias para reducir el desbalanceo. Se tendrá que apuntar la clase de la imagen sobre la que se sacan las imagenes nuevas.
 \subsection{Fase 3: Filtrado de calidad de imagen}
 \begin{itemize}
     \item Desenfoque: Varianza del Laplaciano
     \item Imágenes oscuras: Análisis en espacios de color (HSV/LAB)
     \item Imágenes muy uniformes: Entropía de Shannon
     \item Eliminar imágenes con exceso de lúmen
+    
 \end{itemize}
 \subsection{Fase 4: Eliminación de redundancia temporal}
 Aplicar técnicas de similitud para eliminar frames redundantes, maximizando la variación intra-clase, evitando el overfitting.
@@ -162,9 +163,10 @@ Aplicar técnicas de similitud para eliminar frames redundantes, maximizando la 
     \item Perceptual Hashing (pHash)
     \item Image Matching
     \item Structural Similarity Index Measure (SSIM)
+    \item Debera depender la cantidad de imagenes que nos quedamos de cada una dependiendo de la cantidad de imagenes totales que hayan de cada clase.
 \end{itemize}
 \subsection{Fase 5: Evaluación iterativa del rendimiento}
-Definir un marco de experimentación que registre y compare las métricas del modelo tras la aplicación sucesiva de cada módulo del pipeline, aislando y demostrando el impacto individual de cada técnica. Para realizar esta evuluación se utilizará principalmente la métrica F1-Score macro, además de la matriz de confusión para tener todas las métricas. Para realizar el entrenamiento del modelo se dividirá el dataset en un 80\% para entrenamiento y un 20\% para validación, asegurando que la distribución de clases se mantenga constante en ambos conjuntos, para evitar las clases minoritarias, se usará WeightedRandomSampler de pytorch durante el entrenamiento.
+Definir un marco de experimentación que registre y compare las métricas del modelo tras la aplicación sucesiva de cada módulo del pipeline, aislando y demostrando el impacto individual de cada técnica. Para realizar esta evuluación se utilizará principalmente la métrica F1-Score macro, además de la matriz de confusión para tener todas las métricas. Para realizar el entrenamiento del modelo se dividirá el dataset en un 80\% para entrenamiento y un 20\% para validación, asegurando que la distribución de clases se mantenga constante en ambos conjuntos, para evitar las clases minoritarias, se usará WeightedRandomSampler de pytorch durante el entrenamiento. Probar que cantidad de imagenes del dataset es la más idonea, cambiando todos los procesos de extracción, modificación, etc....
 
 
 
