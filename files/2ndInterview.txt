@@ -16,12 +16,16 @@ WeightedRandomSampler es buena práctica en casos como este?
 
 
 
+EfficientNet - Menos carga computacional pero menos precisión - Usar esta, modelo más pequeño para tener resultado "tamaño b0".
+
+Red neuronal Visual Object Tracking, resultado infalible pero implica usar un modelo de detección de pólipos (existente o nuevo) - Este mejor, buscar arquitectura, buscar comodidad.
+
 Citas estudio médico histologia.
 
-Añadir en el ultimo párrafo que es necesario que los datos sean homogeneos a partir de los datos de los médicos para que sea un experimento replicable.
+Añadir en el ultimo párrafo en la introducción diciendo que es necesario que los datos sean homogeneos a partir de los datos de los médicos para que sea un experimento replicable.
 
 Definir algoritmo secuencial para limpiar las imágenes, definición en el objetivo que como se hará, en detalle en metodologia. 
 
 Matizar como elegiré que imagen tiene mejor calidad para entrenar el modelo. Buscar como se hace esto.
 
-Tener baseline, tener fase 2 y fase 3 (esqueleto), para ver que retocar. 
+Tener baseline, tener fase 2 y fase 3 (esqueleto), para ver que retocar en la próxima reunión (2 semanas). 

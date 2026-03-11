@@ -18,15 +18,33 @@ build/
 
 # Datos y reportes
 data/patient_content/
+data/unified_images/
 
 # Salida de LaTeX y compilaciones
-files/latexInformeFinal/%OUTDIR%/
-files/latexInformeFinal/*.pdf
-files/latexInformeFinal/*.aux
-files/latexInformeFinal/*.out
-files/latexInformeFinal/*.toc
-files/latexInformeFinal/*.log
-files/latexInformeFinal/*.synctex.gz
+**/latexInformeFinal/%OUTDIR%/
+**/*.pdf
+**/*.aux
+**/*.bbl
+**/*.blg
+**/*.out
+**/*.toc
+**/*.log
+**/*.synctex.gz
+**/*.fdb_latexmk
+**/*.fls
+**/*.lof
+**/*.lot
+**/*.dpth
+**/*.md5
+**/*.auxlock
+**/*.ilg
+**/*.ind
+**/*.idx
+**/*.spl
+**/*.navrc
+**/*.snm
+**/*.nav
+**/*.vrb
 
 # Archivos específicos
 utils/Informe_final_ejemplo.pdf
