@@ -8,8 +8,16 @@ TOKEN = os.getenv('DROPBOX_TOKEN')
 URL = os.getenv('DROPBOX_URL')
 PASSWORD = os.getenv('DROPBOX_PASSWORD')
 
+APP_KEY = os.getenv('DROPBOX_APP_KEY')
+APP_SECRET = os.getenv('DROPBOX_APP_SECRET')
+REFRESH_TOKEN = os.getenv('DROPBOX_REFRESH_TOKEN')
+
 # Initialize Dropbox client
-dbx = dropbox.Dropbox(TOKEN)
+dbx = dropbox.Dropbox(
+    app_key=APP_KEY,
+    app_secret=APP_SECRET,
+    oauth2_refresh_token=REFRESH_TOKEN
+)
 
 def download_video_to_temp(patient_id, video_name):
     """
@@ -22,7 +30,7 @@ def download_video_to_temp(patient_id, video_name):
     Returns:
         str: Absolute path of the downloaded file, or None if an error occurred.
     """
-    temp_folder = "temp_workspace"
+    temp_folder = "../temp_workspace"
     if not os.path.exists(temp_folder):
         os.makedirs(temp_folder)
         

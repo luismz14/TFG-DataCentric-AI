@@ -1,32 +1,132 @@
+"""
+Model definition for colorectal polyp histology classification.
+"""
+
+from __future__ import annotations
+
 import torch
 import torch.nn as nn
 from torchvision import models
 
+
 class PolypClassifier(nn.Module):
-    def __init__(self, num_classes: int):
-        """
-        Inicializa el modelo baseline usando EfficientNet-B0 pre-entrenado.
-        """
-        super(PolypClassifier, self).__init__()
-        
-        # 1. Load the pre-trained EfficientNet-B0 model
-        self.backbone = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.DEFAULT)
-        
-        # 2. Fix the backbone layers to prevent them from updating during training
-        for param in self.backbone.parameters():
-            param.requires_grad = False
-            
-        # 3. Modify the classifier to fit our number of classes
+    """EfficientNet-B0 classifier prepared for staged fine-tuning.
+
+    The model starts from ImageNet-pretrained weights, replaces the original
+    classifier head and exposes helper methods so the training pipeline can move
+    from head-only training to partial or full backbone fine-tuning.
+    """
+
+    def __init__(
+        self,
+        num_classes: int,
+        dropout: float = 0.30,
+        stochastic_depth_prob: float = 0.10,
+    ) -> None:
+        super().__init__()
+
+        self.backbone = models.efficientnet_b0(
+            weights=models.EfficientNet_B0_Weights.DEFAULT,
+            stochastic_depth_prob=stochastic_depth_prob,
+        )
+
         in_features = self.backbone.classifier[1].in_features
-        # Replace the last layer of the classifier with a new one that has the correct number of output classes
-        self.backbone.classifier[1] = nn.Linear(in_features, num_classes)
-        
-        # 4. Unfreeze the classifier layers to allow them to be trained
+        self.backbone.classifier = nn.Sequential(
+            nn.Dropout(p=dropout, inplace=True),
+            nn.Linear(in_features, num_classes),
+        )
+
+        self._frozen_feature_block_ids: set[int] = set()
+        self.freeze_backbone()
+        self.unfreeze_classifier()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run a batch of images through the network."""
+        return self.backbone(x)
+
+    def freeze_backbone(self) -> None:
+        """Freeze every convolutional feature block."""
+        for param in self.backbone.features.parameters():
+            param.requires_grad = False
+
+        self._frozen_feature_block_ids = set(range(len(self.backbone.features)))
+
+    def unfreeze_classifier(self) -> None:
+        """Keep the classification head trainable."""
         for param in self.backbone.classifier.parameters():
             param.requires_grad = True
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+
+    def unfreeze_last_feature_blocks(self, num_blocks: int) -> None:
+        """Unfreeze only the last `num_blocks` EfficientNet feature blocks."""
+        self.freeze_backbone()
+        self.unfreeze_classifier()
+
+        total_blocks = len(self.backbone.features)
+        num_blocks = max(0, min(num_blocks, total_blocks))
+        first_trainable_block = total_blocks - num_blocks
+
+        for block_idx in range(first_trainable_block, total_blocks):
+            for param in self.backbone.features[block_idx].parameters():
+                param.requires_grad = True
+
+        self._frozen_feature_block_ids = set(range(first_trainable_block))
+
+    def unfreeze_all(self) -> None:
+        """Unfreeze the full network for end-to-end fine-tuning."""
+        for param in self.backbone.parameters():
+            param.requires_grad = True
+
+        self._frozen_feature_block_ids = set()
+
+    def get_trainable_parameter_groups(
+        self,
+        head_lr: float,
+        backbone_lr: float | None = None,
+    ) -> list[dict[str, object]]:
+        """Return parameter groups with separate learning rates.
+
+        The classifier head typically needs a larger learning rate than the
+        pretrained backbone because it starts from random initialisation.
         """
-        Define cómo fluyen los datos (tensores) a través del modelo.
+
+        backbone_params = []
+        head_params = []
+
+        for name, param in self.backbone.named_parameters():
+            if not param.requires_grad:
+                continue
+
+            if name.startswith("classifier"):
+                head_params.append(param)
+            else:
+                backbone_params.append(param)
+
+        parameter_groups: list[dict[str, object]] = []
+
+        if backbone_params:
+            parameter_groups.append(
+                {
+                    "params": backbone_params,
+                    "lr": backbone_lr if backbone_lr is not None else head_lr,
+                }
+            )
+
+        if head_params:
+            parameter_groups.append({"params": head_params, "lr": head_lr})
+
+        return parameter_groups
+
+    def train(self, mode: bool = True) -> "PolypClassifier":
+        """Keep frozen feature blocks in eval mode during training.
+
+        This prevents BatchNorm statistics from drifting in blocks that are meant
+        to stay frozen.
         """
-        return self.backbone(x)
+
+        super().train(mode)
+
+        if mode:
+            for block_idx in self._frozen_feature_block_ids:
+                self.backbone.features[block_idx].eval()
+
+        return self

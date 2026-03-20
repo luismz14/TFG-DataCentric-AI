@@ -1,281 +1,746 @@
 """
-ModelTrain.py
+Training pipeline for colorectal polyp histology classification.
 
-Training module for colorectal polyp classification.
-Implements a lightweight Model-Centric baseline (EfficientNet-B0)
+The module is intentionally organised from configuration and data preparation
+to optimisation, evaluation and experiment reporting so the training flow can
+be understood from top to bottom.
 """
 
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+import random
+
 import cv2
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
-from torchvision import transforms
-import pandas as pd
-from pathlib import Path
+from sklearn.metrics import classification_report, confusion_matrix, f1_score
 from sklearn.model_selection import GroupShuffleSplit
-import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.metrics import f1_score, confusion_matrix
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+from torchvision import transforms
 from tqdm import tqdm
 
 from .PolypClassifier import PolypClassifier
 
-DATA_DIR = Path(__file__).resolve().parent.parent / 'data'
-RESULTS_DIR = Path(__file__).resolve().parent.parent / 'results'
+
+# ---------------------------------------------------------------------------
+# Project constants
+# ---------------------------------------------------------------------------
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DATA_DIR = PROJECT_ROOT / "data"
+RESULTS_DIR = PROJECT_ROOT / "results"
+
+CLASS_NAMES = [
+    "Adenoma",
+    "Sessile_serrated_adenoma",
+    "Hyperplastic",
+    "Adenocarcinoma",
+]
+LABEL_MAP = {class_name: idx for idx, class_name in enumerate(CLASS_NAMES)}
+
+GROUP_COLUMNS = ("patient_id", "day", "R", "F")
+REQUIRED_METADATA_COLUMNS = {*GROUP_COLUMNS, "histology", "filename"}
 
 
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 
-def perform_clinical_data_split(metadata_path: str | Path, train_ratio: float = 0.8, random_state: int = 42):
+# Slot = True is used to reduce memory and speed up attribute access.
+@dataclass(slots=True)
+class TrainingConfig:
+    """Default hyperparameters for the phase-1 baseline classifier."""
+
+    # Split configuration.
+    train_ratio: float = 0.80
+    random_state: int = 42
+
+    input_size: int = 224
+    val_resize_size: int = 256
+    batch_size: int = 32
+    num_workers: int = 0
+    num_epochs: int = 100
+
+    # Progressive fine-tuning. A short warm-up stabilises the new classifier
+    # head before pretrained convolutional features are updated.
+    warmup_epochs: int = 0
+    trainable_backbone_blocks: int = 3
+    enable_backbone_finetuning: bool = True
+    full_network_finetuning: bool = True
+
+    # Learning rates. The head learns faster than the pretrained backbone to preserve transferable features 
+    head_lr: float = 1e-3
+    fine_tune_head_lr: float = 1e-4
+    backbone_lr: float = 1e-5
+
+    # Regularisation.
+    weight_decay: float = 5e-4
+    dropout: float = 0.30
+    stochastic_depth_prob: float = 0.10
+    label_smoothing: float = 0.02
+
+    # Adaptive training control.
+    scheduler_factor: float = 0.5
+    scheduler_patience: int = 2
+    early_stopping_patience: int = 10
+    min_lr: float = 1e-6
+    gradient_clip_norm: float = 1.0
+
+    # Imbalance handling.
+    use_weighted_loss: bool = True
+    use_weighted_sampler: bool = False
+
+
+@dataclass(slots=True)
+class EvaluationResult:
+    """Validation metrics collected after an epoch."""
+
+    loss: float
+    macro_f1: float
+    confusion_matrix: np.ndarray
+    classification_report: str
+
+
+@dataclass(slots=True)
+class BestCheckpoint:
+    """Best model state seen during training."""
+
+    macro_f1: float = -1.0
+    epoch: int = 0
+    val_loss: float = float("inf")
+    confusion_matrix: np.ndarray | None = None
+    classification_report: str = ""
+
+
+def set_random_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+# ---------------------------------------------------------------------------
+# Data preparation
+# ---------------------------------------------------------------------------
+
+
+def load_metadata(metadata_path: str | Path) -> pd.DataFrame:
+    """Load the training metadata and enforce the expected schema."""
+    metadata_df = pd.read_csv(metadata_path)
+
+    missing_columns = REQUIRED_METADATA_COLUMNS.difference(metadata_df.columns)
+    if missing_columns:
+        missing_columns_str = ", ".join(sorted(missing_columns))
+        raise ValueError(
+            f"Metadata file '{metadata_path}' is missing columns: {missing_columns_str}."
+        )
+
+    metadata_df = metadata_df.dropna(
+        subset=[*GROUP_COLUMNS, "histology", "filename"]
+    ).reset_index(drop=True)
+
+    unknown_labels = sorted(set(metadata_df["histology"]) - set(CLASS_NAMES))
+    if unknown_labels:
+        unknown_labels_str = ", ".join(unknown_labels)
+        raise ValueError(
+            "Unexpected histology labels found in metadata: "
+            f"{unknown_labels_str}."
+        )
+
+    return metadata_df
+
+
+def get_class_counts(dataframe: pd.DataFrame) -> pd.Series:
+    """Return class counts ordered exactly as `CLASS_NAMES`."""
+    return (
+        dataframe["histology"]
+        .value_counts()
+        .reindex(CLASS_NAMES, fill_value=0)
+        .astype(int)
+    )
+
+
+def perform_clinical_data_split(
+    metadata_path: str | Path,
+    train_ratio: float = 0.80,
+    random_state: int = 42,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Split metadata by lesion-level groups to avoid patient leakage.
+
+    Multiple images can belong to the same lesion and look almost identical.
+    Grouping by patient, day and lesion identifiers is therefore more important
+    than exact class stratification for a clinically honest validation split.
     """
-    Performs a strict group-based split to prevent Data Leakage.
 
-    A standard random split would distribute images of the exact same physical polyp into both Train and Validation sets.
-    This split strategy split by unique polyp identifiers.
-    """
-    df = pd.read_csv(metadata_path)
-    # Some annotations of histology are missing.
-    df = df.dropna(subset=['histology'])
-    
-    unique_polyp_identifiers = ['patient_id', 'day', 'R', 'F']
-    df['Group_ID'] = df[unique_polyp_identifiers].astype(str).apply('_'.join, axis=1)
-    
-    X = df['filename']
-    y = df['histology'] 
-    groups = df['Group_ID']
-    
-    # GroupShuffleSplit ensures all records sharing the same Group_ID end up in the same split
-    gss = GroupShuffleSplit(n_splits=1, test_size=(1.0 - train_ratio), random_state=random_state)
-    train_indices, val_indices = next(gss.split(X, y, groups))
-    
-    train_df = df.iloc[train_indices].reset_index(drop=True)
-    val_df = df.iloc[val_indices].reset_index(drop=True)
-    
+    metadata_df = load_metadata(metadata_path).copy()
+    metadata_df["group_id"] = (
+        metadata_df[list(GROUP_COLUMNS)].astype(str).agg("_".join, axis=1)
+    )
+
+    splitter = GroupShuffleSplit(
+        n_splits=1,
+        test_size=1.0 - train_ratio,
+        random_state=random_state,
+    )
+    train_indices, val_indices = next(
+        splitter.split(
+            metadata_df["filename"],
+            metadata_df["histology"],
+            metadata_df["group_id"],
+        )
+    )
+
+    train_df = metadata_df.iloc[train_indices].reset_index(drop=True)
+    val_df = metadata_df.iloc[val_indices].reset_index(drop=True)
     return train_df, val_df
 
 
 class PolypDataset(Dataset):
-    """
-    Lazy-loading custom Dataset.
-    """
-    def __init__(self, dataframe, images_dir: str | Path, transform=None):
-        self.df = dataframe
+    """Lazy-loading dataset for histology-labelled endoscopy frames."""
+
+    def __init__(
+        self,
+        dataframe: pd.DataFrame,
+        images_dir: str | Path,
+        transform: transforms.Compose | None = None,
+    ) -> None:
+        self.dataframe = dataframe.reset_index(drop=True)
         self.images_dir = Path(images_dir)
         self.transform = transform
-        
-        # Maps histologies to integers for PyTorch tensor compatibility
-        self.label_map = {
-            'Adenoma': 0, 
-            'Sessile_serrated_adenoma': 1, 
-            'Hyperplastic': 2, 
-            'Adenocarcinoma': 3
-        }
 
-    def __len__(self):
-        return len(self.df)
+    def __len__(self) -> int:
+        return len(self.dataframe)
 
-    def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        
-        img_path = self.images_dir / row['filename']
-        label_idx = self.label_map[row['histology']]
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, int]:
+        row = self.dataframe.iloc[idx]
+        image_path = self.images_dir / row["filename"]
 
-        image = cv2.imread(str(img_path))
+        image = cv2.imread(str(image_path))
         if image is None:
-            raise FileNotFoundError(f"Corrupted or missing image at: {img_path}")
-            
-        # OpenCV uses BGR. EfficientNet-B0 backbone expects RGB (ImageNet standard).
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            raise FileNotFoundError(f"Missing or unreadable image: {image_path}")
 
-        if self.transform:
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        label_idx = LABEL_MAP[row["histology"]]
+
+        if self.transform is not None:
             image = self.transform(image)
 
         return image, label_idx
 
 
-def evaluate_model(model, val_loader, criterion, device):
+def build_transforms(
+    config: TrainingConfig,
+) -> tuple[transforms.Compose, transforms.Compose]:
+    """Create conservative train/validation transforms.
+
+    Augmentations stay mild because the clinically relevant cues are subtle and
+    aggressive photometric or geometric changes could erase them.
     """
-    Computes validation metrics without updating model weights.
-    """
+
+    normalize = transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225],
+    )
+
+    train_transform = transforms.Compose(
+        [
+            transforms.ToPILImage(),
+            transforms.RandomResizedCrop(
+                config.input_size,
+                scale=(0.90, 1.0),
+                ratio=(0.95, 1.05),
+                interpolation=transforms.InterpolationMode.BICUBIC,
+            ),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomRotation(
+                degrees=10,
+                interpolation=transforms.InterpolationMode.BICUBIC,
+            ),
+            transforms.ColorJitter(
+                brightness=0.10,
+                contrast=0.10,
+                saturation=0.05,
+                hue=0.01,
+            ),
+            transforms.ToTensor(),
+            normalize,
+        ]
+    )
+
+    val_transform = transforms.Compose(
+        [
+            transforms.ToPILImage(),
+            transforms.Resize(
+                config.val_resize_size,
+                interpolation=transforms.InterpolationMode.BICUBIC,
+            ),
+            transforms.CenterCrop(config.input_size),
+            transforms.ToTensor(),
+            normalize,
+        ]
+    )
+
+    return train_transform, val_transform
+
+
+def build_datasets(
+    train_metadata_df: pd.DataFrame,
+    val_metadata_df: pd.DataFrame,
+    images_dir: str | Path,
+    config: TrainingConfig,
+) -> tuple[PolypDataset, PolypDataset]:
+    """Create the train and validation datasets."""
+    train_transforms, val_transforms = build_transforms(config)
+
+    train_dataset = PolypDataset(
+        train_metadata_df,
+        images_dir=images_dir,
+        transform=train_transforms,
+    )
+    val_dataset = PolypDataset(
+        val_metadata_df,
+        images_dir=images_dir,
+        transform=val_transforms,
+    )
+    return train_dataset, val_dataset
+
+
+def build_weighted_sampler(train_metadata_df: pd.DataFrame) -> WeightedRandomSampler:
+    """Create a square-root weighted sampler for optional rebalancing."""
+    class_counts = get_class_counts(train_metadata_df).replace(0, 1)
+    class_sampling_weights = (1.0 / class_counts) ** 0.5
+    sample_weights = [
+        float(class_sampling_weights[histology])
+        for histology in train_metadata_df["histology"]
+    ]
+
+    return WeightedRandomSampler(
+        weights=torch.tensor(sample_weights, dtype=torch.double),
+        num_samples=len(sample_weights),
+        replacement=True,
+    )
+
+
+def build_dataloaders(
+    train_dataset: PolypDataset,
+    val_dataset: PolypDataset,
+    train_metadata_df: pd.DataFrame,
+    config: TrainingConfig,
+    device: torch.device,
+) -> tuple[DataLoader, DataLoader]:
+    """Create dataloaders with the configured balancing strategy."""
+    sampler = (
+        build_weighted_sampler(train_metadata_df)
+        if config.use_weighted_sampler
+        else None
+    )
+
+    dataloader_kwargs = {
+        "batch_size": config.batch_size,
+        "num_workers": config.num_workers,
+        "pin_memory": device.type == "cuda",
+    }
+    if config.num_workers > 0:
+        dataloader_kwargs["persistent_workers"] = True
+
+    train_loader = DataLoader(
+        train_dataset,
+        shuffle=sampler is None,
+        sampler=sampler,
+        **dataloader_kwargs,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        shuffle=False,
+        **dataloader_kwargs,
+    )
+    return train_loader, val_loader
+
+
+# ---------------------------------------------------------------------------
+# Optimisation helpers
+# ---------------------------------------------------------------------------
+
+
+def build_loss_weights(train_metadata_df: pd.DataFrame) -> torch.Tensor:
+    """Compute square-root class weights for stable imbalance handling."""
+    class_counts = get_class_counts(train_metadata_df).replace(0, 1).astype(float)
+    class_weights = (len(train_metadata_df) / (len(CLASS_NAMES) * class_counts)) ** 0.5
+    weights_tensor = torch.tensor(class_weights.to_list(), dtype=torch.float32)
+    return weights_tensor / weights_tensor.mean()
+
+
+def build_criterion(
+    train_metadata_df: pd.DataFrame,
+    config: TrainingConfig,
+    device: torch.device,
+) -> tuple[nn.CrossEntropyLoss, torch.Tensor | None]:
+    """Create the loss function and return the effective class weights."""
+    loss_weights = None
+    if config.use_weighted_loss:
+        loss_weights = build_loss_weights(train_metadata_df).to(device)
+
+    criterion = nn.CrossEntropyLoss(
+        weight=loss_weights,
+        label_smoothing=config.label_smoothing,
+    )
+    return criterion, loss_weights
+
+
+def build_optimizer(
+    model: PolypClassifier,
+    config: TrainingConfig,
+    full_fine_tune: bool,
+) -> tuple[optim.Optimizer, optim.lr_scheduler.ReduceLROnPlateau, str]:
+    """Create the optimiser and scheduler for the current training stage."""
+    if full_fine_tune:
+        if config.full_network_finetuning:
+            model.unfreeze_all()
+            stage_name = "full_network"
+        else:
+            model.unfreeze_last_feature_blocks(config.trainable_backbone_blocks)
+            stage_name = f"last_{config.trainable_backbone_blocks}_blocks"
+
+        parameter_groups = model.get_trainable_parameter_groups(
+            head_lr=config.fine_tune_head_lr,
+            backbone_lr=config.backbone_lr,
+        )
+    else:
+        model.freeze_backbone()
+        model.unfreeze_classifier()
+        parameter_groups = model.get_trainable_parameter_groups(head_lr=config.head_lr)
+        stage_name = "head_only"
+
+    optimizer = optim.AdamW(parameter_groups, weight_decay=config.weight_decay)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="max",
+        factor=config.scheduler_factor,
+        patience=config.scheduler_patience,
+        min_lr=config.min_lr,
+    )
+    return optimizer, scheduler, stage_name
+
+
+def format_learning_rates(optimizer: optim.Optimizer) -> str:
+    """Format the learning rate of every parameter group for logging."""
+    return "/".join(f"{param_group['lr']:.1e}" for param_group in optimizer.param_groups)
+
+
+# ---------------------------------------------------------------------------
+# Evaluation and reporting
+# ---------------------------------------------------------------------------
+
+
+def evaluate_model(
+    model: PolypClassifier,
+    val_loader: DataLoader,
+    criterion: nn.Module,
+    device: torch.device,
+) -> EvaluationResult:
+    """Evaluate the current model without updating the weights."""
     model.eval()
-    
+
     val_loss = 0.0
-    all_predictions = []
-    all_true_labels = []
+    all_predictions: list[int] = []
+    all_true_labels: list[int] = []
 
     with torch.no_grad():
         for images, labels in val_loader:
-            images, labels = images.to(device), labels.to(device)
-            
+            images = images.to(device, non_blocking=device.type == "cuda")
+            labels = labels.to(device, non_blocking=device.type == "cuda")
+
             outputs = model(images)
             loss = criterion(outputs, labels)
             val_loss += loss.item()
-            
-            _, predicted_classes = torch.max(outputs, 1)
-            
-            all_predictions.extend(predicted_classes.cpu().numpy())
-            all_true_labels.extend(labels.cpu().numpy())
 
-    avg_loss = val_loss / len(val_loader)
-    
-    macro_f1 = f1_score(all_true_labels, all_predictions, average='macro')
-    cm = confusion_matrix(all_true_labels, all_predictions)
-    
-    return avg_loss, macro_f1, cm
+            predicted_classes = torch.argmax(outputs, dim=1)
+            all_predictions.extend(predicted_classes.cpu().tolist())
+            all_true_labels.extend(labels.cpu().tolist())
+
+    avg_loss = val_loss / max(1, len(val_loader))
+    macro_f1 = f1_score(
+        all_true_labels,
+        all_predictions,
+        average="macro",
+        zero_division=0,
+    )
+    confusion = confusion_matrix(
+        all_true_labels,
+        all_predictions,
+        labels=list(range(len(CLASS_NAMES))),
+    )
+    report = classification_report(
+        all_true_labels,
+        all_predictions,
+        labels=list(range(len(CLASS_NAMES))),
+        target_names=CLASS_NAMES,
+        zero_division=0,
+        digits=4,
+    )
+
+    return EvaluationResult(
+        loss=avg_loss,
+        macro_f1=macro_f1,
+        confusion_matrix=confusion,
+        classification_report=report,
+    )
 
 
-def plot_and_save_metrics(train_losses, val_losses, val_f1_scores, best_cm, class_names, save_dir=None):
-    """
-    Generates experimental artifacts for the TFG memory and methodological evaluation.
-    """
-    if save_dir is None:
-        save_dir_path = RESULTS_DIR
-    else:        
-        save_dir_path = RESULTS_DIR / Path(save_dir)
-    
+def plot_and_save_metrics(
+    train_losses: list[float],
+    val_losses: list[float],
+    val_f1_scores: list[float],
+    best_confusion_matrix: np.ndarray,
+    class_names: list[str],
+    save_dir: str | Path,
+) -> None:
+    """Generate the plots that summarise the experiment."""
+    save_dir_path = RESULTS_DIR / Path(save_dir)
     save_dir_path.mkdir(parents=True, exist_ok=True)
     epochs = range(1, len(train_losses) + 1)
 
-    # Loss Evolution Plot
     plt.figure(figsize=(10, 6))
-    plt.plot(epochs, train_losses, label='Train Loss', color='blue')
-    plt.plot(epochs, val_losses, label='Validation Loss', color='red')
-    plt.title('Loss Evolution across Epochs')
-    plt.xlabel('Epochs')
-    plt.ylabel('CrossEntropy Loss')
+    plt.plot(epochs, train_losses, label="Train Loss", color="blue")
+    plt.plot(epochs, val_losses, label="Validation Loss", color="red")
+    plt.title("Loss Evolution across Epochs")
+    plt.xlabel("Epochs")
+    plt.ylabel("CrossEntropy Loss")
     plt.legend()
     plt.grid(True)
-    plt.savefig(save_dir_path / 'loss_evolution.png')
-    plt.close()
-
-    # F1-Score Evolution Plot
-    plt.figure(figsize=(10, 6))
-    plt.plot(epochs, val_f1_scores, label='Validation F1-Score (Macro)', color='green')
-    plt.title('Validation F1-Score Evolution')
-    plt.xlabel('Epochs')
-    plt.ylabel('F1-Score')
-    plt.legend()
-    plt.grid(True)
-    plt.savefig(save_dir_path / 'f1_score_evolution.png')
-    plt.close()
-
-    # Confusion Matrix Heatmap
-    plt.figure(figsize=(8, 6))
-    sns.heatmap(best_cm, annot=True, fmt='d', cmap='Blues', xticklabels=class_names, yticklabels=class_names)
-    plt.title('Confusion Matrix (Best Model)')
-    plt.ylabel('True Clinical Label')
-    plt.xlabel('Predicted Label')
     plt.tight_layout()
-    plt.savefig(save_dir_path / 'confusion_matrix.png')
+    plt.savefig(save_dir_path / "loss_evolution.png")
     plt.close()
-    
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(epochs, val_f1_scores, label="Validation Macro F1", color="green")
+    plt.title("Validation F1 Evolution")
+    plt.xlabel("Epochs")
+    plt.ylabel("Macro F1")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(save_dir_path / "f1_score_evolution.png")
+    plt.close()
+
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(
+        best_confusion_matrix,
+        annot=True,
+        fmt="d",
+        cmap="Blues",
+        xticklabels=class_names,
+        yticklabels=class_names,
+    )
+    plt.title("Confusion Matrix (Best Checkpoint)")
+    plt.ylabel("True Label")
+    plt.xlabel("Predicted Label")
+    plt.tight_layout()
+    plt.savefig(save_dir_path / "confusion_matrix.png")
+    plt.close()
+
     print(f"Artifacts successfully written to '{save_dir_path}'.")
 
 
-def train(csv_name: str | Path, images_dir_name: str | Path, save_dir: str):
-    """
-    Orchestrates the data ingestion, sampling logic, optimization loop, 
-    and checkpointing mechanism.
-    """
-    # 1. Data Ingestion & Split
-    csv_path = DATA_DIR / Path(csv_name)
-    train_metadata_df, val_metadata_df = perform_clinical_data_split(csv_path)
+# ---------------------------------------------------------------------------
+# Training loop
+# ---------------------------------------------------------------------------
 
-    data_transforms = transforms.Compose([
-        transforms.ToPILImage(),
-        transforms.Resize((224, 224)), # Mandatory dimension for EfficientNet-B0
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
+
+def train(
+    csv_name: str | Path,
+    images_dir_name: str | Path,
+    save_dir: str | Path,
+    config: TrainingConfig | None = None,
+) -> tuple[PolypClassifier, DataLoader]:
+    """Train the baseline classifier and return the best model plus val loader."""
+    config = config or TrainingConfig()
+    set_random_seed(config.random_state)
+
+    metadata_path = DATA_DIR / Path(csv_name)
     images_dir = DATA_DIR / Path(images_dir_name)
-    train_dataset = PolypDataset(train_metadata_df, images_dir=images_dir, transform=data_transforms)
-    val_dataset = PolypDataset(val_metadata_df, images_dir=images_dir, transform=data_transforms)
+    experiment_dir = RESULTS_DIR / Path(save_dir)
+    experiment_dir.mkdir(parents=True, exist_ok=True)
 
-    # 2. Resampling Strategy
-    class_counts = train_metadata_df['histology'].value_counts().to_dict()
-    sample_weights = [1.0 / class_counts[histology] for histology in train_metadata_df['histology']]
-
-    sampler = WeightedRandomSampler(
-        weights=sample_weights, 
-        num_samples=len(sample_weights), 
-        replacement=True
+    train_metadata_df, val_metadata_df = perform_clinical_data_split(
+        metadata_path,
+        train_ratio=config.train_ratio,
+        random_state=config.random_state,
     )
 
-    train_loader = DataLoader(train_dataset, batch_size=32, sampler=sampler)
-    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
-
-    # 3. Model & Optimizer Instantiation
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Hardware assigned for tensor computations: {device}")
-    
-    model = PolypClassifier(num_classes=4).to(device)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
 
-    num_epochs = 100
+    train_class_counts = get_class_counts(train_metadata_df)
+    val_class_counts = get_class_counts(val_metadata_df)
+    print("Train class distribution:")
+    print(train_class_counts.to_string())
+    print()
+    print("Validation class distribution:")
+    print(val_class_counts.to_string())
 
-    # Telemetry trackers
-    history_train_loss = []
-    history_val_loss = []
-    history_val_f1 = []
-    
-    best_f1_score = 0.0
-    best_confusion_matrix = None
-    
-    experiment_dir = RESULTS_DIR / save_dir
-    experiment_dir.mkdir(parents=True, exist_ok=True)
-    best_model_weights_path = experiment_dir / 'best_baseline_model.pth'
+    train_dataset, val_dataset = build_datasets(
+        train_metadata_df,
+        val_metadata_df,
+        images_dir=images_dir,
+        config=config,
+    )
+    train_loader, val_loader = build_dataloaders(
+        train_dataset,
+        val_dataset,
+        train_metadata_df=train_metadata_df,
+        config=config,
+        device=device,
+    )
 
-    # 4. Training Loop
-    print(f"Initiating Baseline Training Phase. Saving results to: {experiment_dir}")
-    pbar = tqdm(range(num_epochs), desc="Training Progress", unit="epoch")
-    
-    for epoch in pbar:
-        
-        # --- TRAINING PASS ---
+    criterion, loss_weights = build_criterion(train_metadata_df, config, device)
+    if loss_weights is not None:
+        print()
+        print(
+            "Loss weights:",
+            {
+                class_name: round(float(weight), 4)
+                for class_name, weight in zip(CLASS_NAMES, loss_weights.cpu())
+            },
+        )
+
+    model = PolypClassifier(
+        num_classes=len(CLASS_NAMES),
+        dropout=config.dropout,
+        stochastic_depth_prob=config.stochastic_depth_prob,
+    ).to(device)
+
+    optimizer, scheduler, training_stage = build_optimizer(
+        model,
+        config,
+        full_fine_tune=False,
+    )
+
+    history_train_loss: list[float] = []
+    history_val_loss: list[float] = []
+    history_val_f1: list[float] = []
+
+    best_checkpoint = BestCheckpoint()
+    epochs_without_improvement = 0
+    best_model_weights_path = experiment_dir / "best_baseline_model.pth"
+
+    print(f"Initiating training phase. Saving results to: {experiment_dir}")
+    progress_bar = tqdm(range(config.num_epochs), desc="Training Progress", unit="epoch")
+
+    for epoch in progress_bar:
+        if config.enable_backbone_finetuning and epoch == config.warmup_epochs:
+            optimizer, scheduler, training_stage = build_optimizer(
+                model,
+                config,
+                full_fine_tune=True,
+            )
+            fine_tuning_description = (
+                "full-network fine-tuning"
+                if config.full_network_finetuning
+                else f"partial backbone fine-tuning ({config.trainable_backbone_blocks} blocks)"
+            )
+            print()
+            print(f"Switching to {fine_tuning_description} at epoch {epoch + 1}.")
+
         model.train()
         running_train_loss = 0.0
-        
+
         for images, labels in train_loader:
-            images, labels = images.to(device), labels.to(device)
-            
-            optimizer.zero_grad()
+            images = images.to(device, non_blocking=device.type == "cuda")
+            labels = labels.to(device, non_blocking=device.type == "cuda")
+
+            optimizer.zero_grad(set_to_none=True)
             predictions = model(images)
             loss = criterion(predictions, labels)
-            
             loss.backward()
-            optimizer.step()
-            
-            running_train_loss += loss.item()
-            
-        epoch_train_loss = running_train_loss / len(train_loader)
-        
-        # --- VALIDATION PASS ---
-        epoch_val_loss, epoch_val_f1, current_cm = evaluate_model(model, val_loader, criterion, device)
-        
-        history_train_loss.append(epoch_train_loss)
-        history_val_loss.append(epoch_val_loss)
-        history_val_f1.append(epoch_val_f1)
-        
-        # --- CHECKPOINTING MECHANISM ---
-        checkpoint_status = ""
-        if epoch_val_f1 > best_f1_score:
-            best_f1_score = epoch_val_f1
-            best_confusion_matrix = current_cm
-            torch.save(model.state_dict(), best_model_weights_path)
-            checkpoint_status = " 💾 [SAVED]"
-            
-        pbar.set_postfix({
-            'Train Loss': f"{epoch_train_loss:.4f}",
-            'Val Loss': f"{epoch_val_loss:.4f}",
-            'Val F1': f"{epoch_val_f1:.4f}{checkpoint_status}"
-        })
-    
-    print()
-    print(f"Optimization sequence completed. Optimal Validation F1-Score: {best_f1_score:.4f}")
 
-    # Generate visual artifacts based on the final telemetry
-    class_names = ['Adenoma', 'Sessile Serrated', 'Hyperplastic', 'Adenocarcinoma']
-    plot_and_save_metrics(history_train_loss, history_val_loss, history_val_f1, best_confusion_matrix, class_names, save_dir=save_dir)
-    
+            if config.gradient_clip_norm > 0:
+                nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip_norm)
+
+            optimizer.step()
+            running_train_loss += loss.item()
+
+        epoch_train_loss = running_train_loss / max(1, len(train_loader))
+        validation_result = evaluate_model(
+            model,
+            val_loader,
+            criterion,
+            device,
+        )
+
+        history_train_loss.append(epoch_train_loss)
+        history_val_loss.append(validation_result.loss)
+        history_val_f1.append(validation_result.macro_f1)
+
+        scheduler.step(validation_result.macro_f1)
+
+        checkpoint_status = ""
+        if validation_result.macro_f1 > best_checkpoint.macro_f1 + 1e-4:
+            best_checkpoint.macro_f1 = validation_result.macro_f1
+            best_checkpoint.epoch = epoch + 1
+            best_checkpoint.val_loss = validation_result.loss
+            best_checkpoint.confusion_matrix = validation_result.confusion_matrix
+            best_checkpoint.classification_report = (
+                validation_result.classification_report
+            )
+            epochs_without_improvement = 0
+            torch.save(model.state_dict(), best_model_weights_path)
+            checkpoint_status = " [saved]"
+        else:
+            epochs_without_improvement += 1
+
+        progress_bar.set_postfix(
+            {
+                "Stage": training_stage,
+                "Train Loss": f"{epoch_train_loss:.4f}",
+                "Val Loss": f"{validation_result.loss:.4f}",
+                "Val F1": f"{validation_result.macro_f1:.4f}{checkpoint_status}",
+                "LR": format_learning_rates(optimizer),
+            }
+        )
+
+        if (
+            epoch + 1 > config.warmup_epochs
+            and epochs_without_improvement >= config.early_stopping_patience
+        ):
+            print()
+            print(
+                "Early stopping triggered after "
+                f"{config.early_stopping_patience} epochs without improving macro-F1."
+            )
+            break
+
+    if best_model_weights_path.exists():
+        model.load_state_dict(torch.load(best_model_weights_path, map_location=device))
+
+    if best_checkpoint.confusion_matrix is None:
+        raise RuntimeError("Training finished without producing a valid checkpoint.")
+
+    print()
+    print(
+        "Optimization sequence completed. "
+        f"Best validation macro-F1: {best_checkpoint.macro_f1:.4f} "
+        f"at epoch {best_checkpoint.epoch}."
+    )
+
+    plot_and_save_metrics(
+        history_train_loss,
+        history_val_loss,
+        history_val_f1,
+        best_checkpoint.confusion_matrix,
+        CLASS_NAMES,
+        save_dir=save_dir,
+    )
+
     return model, val_loader
