@@ -36,6 +36,10 @@ def download_video_to_temp(patient_id, video_name):
         
     # Create absolute path for local storage
     local_video_path = os.path.abspath(os.path.join(temp_folder, video_name))
+
+    if os.path.exists(local_video_path) and os.path.getsize(local_video_path) > 0:
+        print(f"Reusing local video: {local_video_path}")
+        return local_video_path
     
     # Robust construction of the Dropbox path
     # We assume the structure is /PatientID/VideoName inside the shared link

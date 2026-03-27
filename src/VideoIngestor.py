@@ -1,15 +1,15 @@
 import sys
-sys.path.append('..')
 
-import csv
+sys.path.append("..")
+
+import shutil
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
+import pandas as pd
 from ultralytics import YOLO
-
-from dropbox_utils.manage_temp_video import delete_temp_video, download_video_to_temp
 
 
 @dataclass
@@ -20,23 +20,25 @@ class ClinicalVideoRecord:
     R: str
     F: str
     histology: str
+    filename: str = ""
 
 
 class VideoIngestor:
     def __init__(
-            self,
-            yolo_weights_path: str | Path,
-            output_dir: str | Path = "data/phase2/frames",
-            target_fps: int = 5,
-            window_sec: int = 3,
-            conf_threshold: float = 0.15,
-            min_track_hits: int = 2,
-            max_candidates_per_video: int = 5,
-            csv_name: str = "data.csv",
-        ):
+        self,
+        yolo_weights_path: str | Path,
+        output_dir: str | Path = "data/phase2/frames",
+        original_images_dir: str | Path = "data/unified_images",
+        target_fps: int = 5,
+        window_sec: int = 3,
+        conf_threshold: float = 0.15,
+        min_track_hits: int = 2,
+        max_candidates_per_video: int = 5,
+    ):
         self.detector = YOLO(str(yolo_weights_path))
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.original_images_dir = Path(original_images_dir)
 
         self.target_fps = target_fps
         self.window_sec = window_sec
@@ -44,15 +46,12 @@ class VideoIngestor:
         self.min_track_hits = min_track_hits
         self.max_candidates_per_video = max_candidates_per_video
 
-        self.manifest_path = self.output_dir / csv_name
-        self._ensure_manifest_exists()
-
     def process_clinical_video(
-            self,
-            video_path: str | Path,
-            timestamp_sec: float,
-            record: ClinicalVideoRecord,
-        ) -> list[dict]:
+        self,
+        video_path: str | Path,
+        timestamp_sec: float,
+        record: ClinicalVideoRecord,
+    ) -> list[str]:
         if video_path is None:
             raise ValueError("video_path is None. Video download probably failed.")
 
@@ -85,10 +84,10 @@ class VideoIngestor:
             return []
 
         clinical_roi = None
-        track_store = {}
-        frame_cache = {}
+        track_store: dict[int, dict[str, list | int]] = {}
+        frame_cache: dict[int, object] = {}
 
-        # Reset YOLO internal predictor state so tracks do not leak across videos.
+        # Reset YOLO internal predictor state so tracks do not leak across timestamps.
         self.detector.predictor = None
 
         for frame_idx in sampled_indices:
@@ -97,7 +96,6 @@ class VideoIngestor:
             if not ret:
                 continue
 
-            # The ROI is computed once from the first valid frame, removing the black border.
             if clinical_roi is None:
                 clinical_roi = self._detect_clinical_area(frame)
 
@@ -120,8 +118,6 @@ class VideoIngestor:
                 continue
 
             if boxes_obj.id is None:
-                # If there are detections but no stable track IDs,
-                # we ignore them here and rely on fallback later.
                 continue
 
             if boxes_obj.conf is not None:
@@ -148,78 +144,129 @@ class VideoIngestor:
         cap.release()
 
         primary_track_id = self._select_primary_track(track_store, timestamp_frame)
-
-        saved_rows = []
         sequence_counter = 1
+        saved_filenames: list[str] = []
 
         if primary_track_id is not None:
             selected_frames = self._select_frames_from_track(
                 track_data=track_store[primary_track_id],
                 timestamp_frame=timestamp_frame,
-                max_candidates=self._num_candidates_for_histology(record.histology),
+                max_candidates=self.max_candidates_per_video,
                 min_gap_frames=max(1, round(original_fps / self.target_fps)),
             )
-
-            for frame_idx in selected_frames:
-                frame = frame_cache[frame_idx]
-                filename = self._build_output_filename(record, sequence_counter)
-
-                save_path = self._save_clean_frame(
-                    frame=frame,
-                    histology=record.histology,
-                    filename=filename,
-                )
-
-                row = {
-                    "patient_id": record.patient_id,
-                    "day": record.day,
-                    "hour": record.hour,
-                    "R": record.R,
-                    "F": record.F,
-                    "histology": record.histology,
-                    "filename": save_path.name,
-                }
-                self._append_manifest_row(row)
-                saved_rows.append(row)
-                sequence_counter += 1
-
         else:
-            # Fallback keeps phase 2 useful even when detection/tracking fails.
-            # We still export a few frames around the timestamp instead of returning nothing.
-            fallback_frames = self._select_fallback_frames(
+            selected_frames = self._select_fallback_frames(
                 sampled_indices=sampled_indices,
                 timestamp_frame=timestamp_frame,
-                max_candidates=self._num_candidates_for_histology(record.histology),
+                max_candidates=self.max_candidates_per_video,
             )
 
-            for frame_idx in fallback_frames:
-                frame = frame_cache[frame_idx]
-                filename = self._build_output_filename(record, sequence_counter)
+        for frame_idx in selected_frames:
+            frame = frame_cache[frame_idx]
+            filename = self._build_output_filename(record, sequence_counter)
+            save_path = self._save_clean_frame(frame=frame, filename=filename)
 
-                save_path = self._save_clean_frame(
-                    frame=frame,
-                    histology=record.histology,
-                    filename=filename,
+            saved_filenames.append(save_path.name)
+            sequence_counter += 1
+
+        return saved_filenames
+
+    def augment_video_rows(
+        self,
+        video_path: str | Path,
+        metadata_rows: pd.DataFrame | list[dict],
+    ) -> pd.DataFrame:
+        metadata_df = (
+            metadata_rows.copy()
+            if isinstance(metadata_rows, pd.DataFrame)
+            else pd.DataFrame(metadata_rows)
+        )
+
+        if metadata_df.empty:
+            return metadata_df.copy()
+
+        required_columns = {
+            "patient_id",
+            "day",
+            "hour",
+            "R",
+            "F",
+            "histology",
+            "filename",
+            "elapsed_seconds",
+        }
+        missing_columns = sorted(required_columns - set(metadata_df.columns))
+        if missing_columns:
+            raise ValueError(
+                "metadata_rows is missing required columns: " + ", ".join(missing_columns)
+            )
+
+        metadata_df = metadata_df.copy()
+        metadata_df["elapsed_seconds"] = pd.to_numeric(
+            metadata_df["elapsed_seconds"],
+            errors="raise",
+        )
+
+        output_df = metadata_df.drop(
+            columns=["elapsed_seconds", "video_filename"],
+            errors="ignore",
+        ).reset_index(drop=True)
+
+        for original_filename in output_df["filename"].drop_duplicates():
+            self._copy_original_image(original_filename)
+
+        total_rows = len(metadata_df)
+        new_rows: list[dict[str, str]] = []
+
+        for row_index, row in enumerate(metadata_df.to_dict(orient="records"), start=1):
+            base_row = {
+                column: row[column]
+                for column in output_df.columns
+                if column != "filename"
+            }
+            record = ClinicalVideoRecord(
+                patient_id=str(row["patient_id"]),
+                day=str(row["day"]),
+                hour=str(row["hour"]),
+                R=str(row["R"]),
+                F=str(row["F"]),
+                histology=str(row["histology"]),
+                filename=str(row["filename"]),
+            )
+
+            saved_filenames = self.process_clinical_video(
+                video_path=video_path,
+                timestamp_sec=float(row["elapsed_seconds"]),
+                record=record,
+            )
+
+            for saved_filename in saved_filenames:
+                new_rows.append(
+                    {
+                        **base_row,
+                        "filename": saved_filename,
+                    }
                 )
 
-                row = {
-                    "patient_id": record.patient_id,
-                    "day": record.day,
-                    "hour": record.hour,
-                    "R": record.R,
-                    "F": record.F,
-                    "histology": record.histology,
-                    "filename": save_path.name,
-                }
-                self._append_manifest_row(row)
-                saved_rows.append(row)
-                sequence_counter += 1
+            self._print_progress(
+                patient_id=record.patient_id,
+                current_row=row_index,
+                total_rows=total_rows,
+                generated_rows=len(new_rows),
+            )
 
-        return saved_rows
+        if total_rows > 0:
+            print()
+
+        if not new_rows:
+            return output_df
+
+        new_rows_df = pd.DataFrame(new_rows, columns=output_df.columns)
+        return pd.concat([output_df, new_rows_df], ignore_index=True)
 
     def _crop_frame(self, frame, roi):
         x, y, w, h = roi
-        return frame[y:y + h, x:x + w]
+        return frame[y : y + h, x : x + w]
 
     def _detect_clinical_area(self, frame):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -233,7 +280,6 @@ class VideoIngestor:
         largest_contour = max(contours, key=cv2.contourArea)
         x, y, w, h = cv2.boundingRect(largest_contour)
 
-        # Small padding avoids cropping useful border information too aggressively.
         padding = 10
         x = max(0, x - padding)
         y = max(0, y - padding)
@@ -251,34 +297,27 @@ class VideoIngestor:
 
             min_distance = min(abs(f - timestamp_frame) for f in data["frames"])
             mean_conf = sum(data["confs"]) / max(1, len(data["confs"]))
-
             candidates.append((track_id, data["hits"], min_distance, mean_conf))
 
         if not candidates:
             return None
 
-        # Priority:
-        # 1) more hits
-        # 2) closer to timestamp
-        # 3) higher mean confidence
         candidates.sort(key=lambda x: (-x[1], x[2], -x[3]))
         return candidates[0][0]
 
     def _select_frames_from_track(
-            self,
-            track_data: dict,
-            timestamp_frame: int,
-            max_candidates: int,
-            min_gap_frames: int,
-        ) -> list[int]:
+        self,
+        track_data: dict,
+        timestamp_frame: int,
+        max_candidates: int,
+        min_gap_frames: int,
+    ) -> list[int]:
         frames = sorted(set(track_data["frames"]))
-
-        # We prioritize frames closest to the timestamp first,
         ordered = sorted(frames, key=lambda f: abs(f - timestamp_frame))
 
         selected = []
         for frame_idx in ordered:
-            if all(abs(frame_idx - s) >= min_gap_frames for s in selected):
+            if all(abs(frame_idx - chosen) >= min_gap_frames for chosen in selected):
                 selected.append(frame_idx)
             if len(selected) >= max_candidates:
                 break
@@ -286,116 +325,46 @@ class VideoIngestor:
         return sorted(selected)
 
     def _select_fallback_frames(
-            self,
-            sampled_indices: list[int],
-            timestamp_frame: int,
-            max_candidates: int,
-        ) -> list[int]:
+        self,
+        sampled_indices: list[int],
+        timestamp_frame: int,
+        max_candidates: int,
+    ) -> list[int]:
         ordered = sorted(sampled_indices, key=lambda f: abs(f - timestamp_frame))
-        selected = ordered[:max_candidates]
-        return sorted(selected)
-
-    def _num_candidates_for_histology(self, histology: str) -> int:
-        # This is the place where class-dependent sampling can be added later.
-        return self.max_candidates_per_video
+        return sorted(ordered[:max_candidates])
 
     def _build_output_filename(self, record: ClinicalVideoRecord, sequence_number: int) -> str:
+        if record.filename:
+            source_path = Path(record.filename)
+            suffix = source_path.suffix or ".jpg"
+            return f"{source_path.stem}_{sequence_number}{suffix}"
+
         short_uid = uuid.uuid4().hex[:16]
         return f"{record.day}_{record.hour}_{record.R}_{record.F}_S{sequence_number}_{short_uid}.jpg"
 
-    def _save_clean_frame(self, frame, histology: str, filename: str) -> Path:
-        class_dir = self.output_dir / histology
-        class_dir.mkdir(parents=True, exist_ok=True)
-
-        save_path = class_dir / filename
+    def _save_clean_frame(self, frame, filename: str) -> Path:
+        save_path = self.output_dir / filename
         cv2.imwrite(str(save_path), frame)
         return save_path
 
-    def _ensure_manifest_exists(self):
-        if self.manifest_path.exists():
-            return
+    def _copy_original_image(self, filename: str) -> Path:
+        source_path = self.original_images_dir / filename
+        if not source_path.exists():
+            raise FileNotFoundError(f"Could not find original image: {source_path}")
 
-        with open(self.manifest_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(
-                f,
-                fieldnames=["patient_id", "day", "hour", "R", "F", "histology", "filename"],
-            )
-            writer.writeheader()
+        destination_path = self.output_dir / filename
+        shutil.copy2(source_path, destination_path)
+        return destination_path
 
-    def _append_manifest_row(self, row: dict):
-        with open(self.manifest_path, "a", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(
-                f,
-                fieldnames=["patient_id", "day", "hour", "R", "F", "histology", "filename"],
-            )
-            writer.writerow(row)
-
-
-if __name__ == "__main__":
-    patient_id = "70772215"
-    video_name = "20250506_101047_R2_2cd5b88838919cc8.mp4"
-    timestamp_sec = 6.0
-
-    path = download_video_to_temp(patient_id, video_name)
-
-    if path is None:
-        raise RuntimeError(
-            f"Could not download video '{video_name}' for patient '{patient_id}'."
+    def _print_progress(
+        self,
+        patient_id: str,
+        current_row: int,
+        total_rows: int,
+        generated_rows: int,
+    ) -> None:
+        print(
+            f"\r{patient_id} data increased {current_row}/{total_rows} | generated {generated_rows}",
+            end="",
+            flush=True,
         )
-
-    record = ClinicalVideoRecord(
-        patient_id="70772215",
-        day="20250506",
-        hour="100854",
-        R="R1",
-        F="F0",
-        histology="prueba1",
-    )
-
-    VI = VideoIngestor(
-        yolo_weights_path="../utils/models/Kvasir_yolov8m.pt",
-        output_dir="output_dir",
-        target_fps=5,
-        window_sec=3,
-        conf_threshold=0.15,
-        min_track_hits=2,
-        max_candidates_per_video=5,
-    )
-
-    rows = VI.process_clinical_video(
-        video_path=path,
-        timestamp_sec=timestamp_sec,
-        record=record,
-    )
-
-    print(f"Saved {len(rows)} images.")
-    delete_temp_video(path)
-
-    patient_id = "4163720"
-    video_name = "20241218_135252_R3_5bc1fdea43b22bb1.mp4"
-    timestamp_sec = 9.0
-
-    path = download_video_to_temp(patient_id, video_name)
-
-    if path is None:
-        raise RuntimeError(
-            f"Could not download video '{video_name}' for patient '{patient_id}'."
-        )
-
-    record = ClinicalVideoRecord(
-        patient_id="4163720",
-        day="20241218",
-        hour="135252",
-        R="R3",
-        F="F0",
-        histology="prueba2",
-    )
-
-    rows = VI.process_clinical_video(
-    video_path=path,
-    timestamp_sec=timestamp_sec,
-    record=record,
-    )
-
-    print(f"Saved {len(rows)} images.")
-    delete_temp_video(path)
