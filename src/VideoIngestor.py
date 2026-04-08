@@ -146,19 +146,23 @@ class VideoIngestor:
         primary_track_id = self._select_primary_track(track_store, timestamp_frame)
         sequence_counter = 1
         saved_filenames: list[str] = []
+        max_candidates = self._num_candidates_for_histology(record.histology)
+
+        if max_candidates <= 0:
+            return []
 
         if primary_track_id is not None:
             selected_frames = self._select_frames_from_track(
                 track_data=track_store[primary_track_id],
                 timestamp_frame=timestamp_frame,
-                max_candidates=self.max_candidates_per_video,
+                max_candidates=max_candidates,
                 min_gap_frames=max(1, round(original_fps / self.target_fps)),
             )
         else:
             selected_frames = self._select_fallback_frames(
                 sampled_indices=sampled_indices,
                 timestamp_frame=timestamp_frame,
-                max_candidates=self.max_candidates_per_video,
+                max_candidates=max_candidates,
             )
 
         for frame_idx in selected_frames:
@@ -170,6 +174,15 @@ class VideoIngestor:
             sequence_counter += 1
 
         return saved_filenames
+
+    def _num_candidates_for_histology(self, histology: str) -> int:
+        hist = {
+            "Adenoma": 1,
+            "Sessile_serrated_adenoma": 2,
+            "Hyperplastic": 4,
+            "Adenocarcinoma": 6,
+        }
+        return hist.get(histology, -1)
 
     def augment_video_rows(
         self,
@@ -353,7 +366,20 @@ class VideoIngestor:
             raise FileNotFoundError(f"Could not find original image: {source_path}")
 
         destination_path = self.output_dir / filename
-        shutil.copy2(source_path, destination_path)
+
+        image = cv2.imread(str(source_path), cv2.IMREAD_COLOR)
+        if image is None or image.size == 0:
+            raise ValueError(f"Could not read image from path: {source_path}")
+
+        roi = self._detect_clinical_area(image)
+        x, y, w, h = roi
+
+        if (x, y, w, h) == (0, 0, image.shape[1], image.shape[0]):
+            shutil.copy2(source_path, destination_path)
+        else:
+            cropped = self._crop_frame(image, roi)
+            cv2.imwrite(str(destination_path), cropped)
+
         return destination_path
 
     def _print_progress(
