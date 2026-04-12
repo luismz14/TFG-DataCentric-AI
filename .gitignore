@@ -20,6 +20,9 @@ build/
 data/patient_content/
 data/unified_images/
 data/phase2/frames/*
+results/*
+data/phase2/frames/*
+
 
 # Salida de LaTeX y compilaciones
 **/latexInformeFinal/%OUTDIR%/
