@@ -278,12 +278,6 @@ def add_blur_values(
     circular central field of view. Lower values indicate stronger blur.
     """
 
-    if image_column not in dataframe.columns:
-        raise KeyError(f"Column not found in dataframe: {image_column}")
-
-    if not 0.0 < fov_radius_ratio <= 1.0:
-        raise ValueError("fov_radius_ratio must be in the interval (0, 1].")
-
     images_dir = Path(images_dir)
     dataframe = dataframe.copy()
     dataframe[output_column] = np.nan

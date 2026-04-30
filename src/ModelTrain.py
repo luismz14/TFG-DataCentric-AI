@@ -21,7 +21,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from sklearn.metrics import classification_report, confusion_matrix, f1_score
-from sklearn.model_selection import GroupShuffleSplit
+from sklearn.model_selection import StratifiedGroupKFold
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torchvision import transforms
 from tqdm import tqdm
@@ -96,6 +96,7 @@ class TrainingConfig:
     # Imbalance handling.
     use_weighted_loss: bool = True
     use_weighted_sampler: bool = False
+    class_weight_exponent: float = 0.5
 
 
 @dataclass(slots=True)
@@ -171,16 +172,26 @@ def get_class_counts(dataframe: pd.DataFrame) -> pd.Series:
     )
 
 
+def get_n_splits_from_train_ratio(train_ratio: float) -> int:
+    """Convert a desired train ratio into the closest validation fold count."""
+    val_ratio = 1.0 - train_ratio
+    if not 0.0 < val_ratio < 1.0:
+        raise ValueError(f"train_ratio must be between 0 and 1, got {train_ratio}.")
+
+    return max(2, round(1.0 / val_ratio))
+
+
 def perform_clinical_data_split(
     metadata_path: str | Path,
     train_ratio: float = 0.80,
     random_state: int = 42,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Split metadata by lesion-level groups to avoid patient leakage.
+    """Split metadata with stratified lesion-level groups.
 
     Multiple images can belong to the same lesion and look almost identical.
-    Grouping by patient, day and lesion identifiers is therefore more important
-    than exact class stratification for a clinically honest validation split.
+    Grouping by patient, day and lesion identifiers avoids leakage, while
+    stratification keeps the validation class distribution as stable as the
+    group constraints allow.
     """
 
     metadata_df = load_metadata(metadata_path).copy()
@@ -188,16 +199,16 @@ def perform_clinical_data_split(
         metadata_df[list(GROUP_COLUMNS)].astype(str).agg("_".join, axis=1)
     )
 
-    splitter = GroupShuffleSplit(
-        n_splits=1,
-        test_size=1.0 - train_ratio,
+    splitter = StratifiedGroupKFold(
+        n_splits=get_n_splits_from_train_ratio(train_ratio),
+        shuffle=True,
         random_state=random_state,
     )
     train_indices, val_indices = next(
         splitter.split(
             metadata_df["filename"],
             metadata_df["histology"],
-            metadata_df["group_id"],
+            groups=metadata_df["group_id"],
         )
     )
 
@@ -263,6 +274,7 @@ def build_transforms(
                 interpolation=transforms.InterpolationMode.BICUBIC,
             ),
             transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomVerticalFlip(p=0.5),
             transforms.RandomRotation(
                 degrees=10,
                 interpolation=transforms.InterpolationMode.BICUBIC,
@@ -271,7 +283,10 @@ def build_transforms(
                 brightness=0.10,
                 contrast=0.10,
                 saturation=0.05,
-                hue=0.01,
+            ),
+            transforms.RandomAdjustSharpness(
+                sharpness_factor=1.5,
+                p=0.15,
             ),
             transforms.ToTensor(),
             normalize,
@@ -316,10 +331,13 @@ def build_datasets(
     return train_dataset, val_dataset
 
 
-def build_weighted_sampler(train_metadata_df: pd.DataFrame) -> WeightedRandomSampler:
-    """Create a square-root weighted sampler for optional rebalancing."""
+def build_weighted_sampler(
+    train_metadata_df: pd.DataFrame,
+    config: TrainingConfig,
+) -> WeightedRandomSampler:
+    """Create a weighted sampler for optional rebalancing."""
     class_counts = get_class_counts(train_metadata_df).replace(0, 1)
-    class_sampling_weights = (1.0 / class_counts) ** 0.5
+    class_sampling_weights = (1.0 / class_counts) ** config.class_weight_exponent
     sample_weights = [
         float(class_sampling_weights[histology])
         for histology in train_metadata_df["histology"]
@@ -341,7 +359,7 @@ def build_dataloaders(
 ) -> tuple[DataLoader, DataLoader]:
     """Create dataloaders with the configured balancing strategy."""
     sampler = (
-        build_weighted_sampler(train_metadata_df)
+        build_weighted_sampler(train_metadata_df, config)
         if config.use_weighted_sampler
         else None
     )
@@ -373,10 +391,13 @@ def build_dataloaders(
 # ---------------------------------------------------------------------------
 
 
-def build_loss_weights(train_metadata_df: pd.DataFrame) -> torch.Tensor:
-    """Compute square-root class weights for stable imbalance handling."""
+def build_loss_weights(
+    train_metadata_df: pd.DataFrame,
+    config: TrainingConfig,
+) -> torch.Tensor:
+    """Compute class weights for stable imbalance handling."""
     class_counts = get_class_counts(train_metadata_df).replace(0, 1).astype(float)
-    class_weights = (len(train_metadata_df) / (len(CLASS_NAMES) * class_counts)) ** 0.5
+    class_weights = (len(train_metadata_df) / (len(CLASS_NAMES) * class_counts)) ** config.class_weight_exponent
     weights_tensor = torch.tensor(class_weights.to_list(), dtype=torch.float32)
     return weights_tensor / weights_tensor.mean()
 
@@ -389,13 +410,109 @@ def build_criterion(
     """Create the loss function and return the effective class weights."""
     loss_weights = None
     if config.use_weighted_loss:
-        loss_weights = build_loss_weights(train_metadata_df).to(device)
+        loss_weights = build_loss_weights(train_metadata_df, config).to(device)
 
     criterion = nn.CrossEntropyLoss(
         weight=loss_weights,
         label_smoothing=config.label_smoothing,
     )
     return criterion, loss_weights
+
+
+def build_decay_parameter_groups(
+    model: PolypClassifier,
+    head_lr: float,
+    backbone_lr: float | None = None,
+    weight_decay: float = 0.0,
+) -> list[dict[str, object]]:
+    """Split trainable parameters into decay / no-decay groups.
+
+    - weight decay for conv/linear weights
+    - no weight decay for biases
+    - no weight decay for normalization layers (BatchNorm, LayerNorm, etc.)
+    """
+
+    normalization_layers = (
+        nn.BatchNorm1d,
+        nn.BatchNorm2d,
+        nn.BatchNorm3d,
+        nn.SyncBatchNorm,
+        nn.LayerNorm,
+        nn.GroupNorm,
+        nn.InstanceNorm1d,
+        nn.InstanceNorm2d,
+        nn.InstanceNorm3d,
+    )
+
+    backbone_decay = []
+    backbone_no_decay = []
+    head_decay = []
+    head_no_decay = []
+
+    for module_name, module in model.backbone.named_modules():
+        for param_name, param in module.named_parameters(recurse=False):
+            if not param.requires_grad:
+                continue
+
+            full_name = f"{module_name}.{param_name}" if module_name else param_name
+            is_head = full_name.startswith("classifier")
+            is_bias = param_name.endswith("bias")
+            is_norm = isinstance(module, normalization_layers)
+
+            if is_head:
+                if is_bias or is_norm:
+                    head_no_decay.append(param)
+                else:
+                    head_decay.append(param)
+            else:
+                if is_bias or is_norm:
+                    backbone_no_decay.append(param)
+                else:
+                    backbone_decay.append(param)
+
+    parameter_groups: list[dict[str, object]] = []
+
+    if backbone_decay:
+        parameter_groups.append(
+            {
+                "params": backbone_decay,
+                "lr": backbone_lr if backbone_lr is not None else head_lr,
+                "weight_decay": weight_decay,
+                "name": "backbone_decay",
+            }
+        )
+
+    if backbone_no_decay:
+        parameter_groups.append(
+            {
+                "params": backbone_no_decay,
+                "lr": backbone_lr if backbone_lr is not None else head_lr,
+                "weight_decay": 0.0,
+                "name": "backbone_no_decay",
+            }
+        )
+
+    if head_decay:
+        parameter_groups.append(
+            {
+                "params": head_decay,
+                "lr": head_lr,
+                "weight_decay": weight_decay,
+                "name": "head_decay",
+            }
+        )
+
+    if head_no_decay:
+        parameter_groups.append(
+            {
+                "params": head_no_decay,
+                "lr": head_lr,
+                "weight_decay": 0.0,
+                "name": "head_no_decay",
+            }
+        )
+
+    return parameter_groups
 
 
 def build_optimizer(
@@ -416,13 +533,29 @@ def build_optimizer(
             head_lr=config.fine_tune_head_lr,
             backbone_lr=config.backbone_lr,
         )
+        if len(parameter_groups) == 1:
+            parameter_groups[0]["name"] = "head"
+        elif len(parameter_groups) == 2:
+            parameter_groups[0]["name"] = "backbone"
+            parameter_groups[1]["name"] = "head"
+
+        optimizer = optim.AdamW(parameter_groups, weight_decay=config.weight_decay)
     else:
         model.freeze_backbone()
         model.unfreeze_classifier()
-        parameter_groups = model.get_trainable_parameter_groups(head_lr=config.head_lr)
         stage_name = "head_only"
 
-    optimizer = optim.AdamW(parameter_groups, weight_decay=config.weight_decay)
+        parameter_groups = model.get_trainable_parameter_groups(
+            head_lr=config.head_lr
+        )
+        if len(parameter_groups) == 1:
+            parameter_groups[0]["name"] = "head"
+        elif len(parameter_groups) == 2:
+            parameter_groups[0]["name"] = "backbone"
+            parameter_groups[1]["name"] = "head"
+
+        optimizer = optim.AdamW(parameter_groups, weight_decay=config.weight_decay)
+
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode="max",
@@ -436,6 +569,42 @@ def build_optimizer(
 def format_learning_rates(optimizer: optim.Optimizer) -> str:
     """Format the learning rate of every parameter group for logging."""
     return "/".join(f"{param_group['lr']:.1e}" for param_group in optimizer.param_groups)
+
+def get_learning_rate_snapshot(optimizer: optim.Optimizer) -> dict[str, float]:
+    """Return current LR per named parameter group."""
+    lr_snapshot: dict[str, float] = {}
+
+    for idx, param_group in enumerate(optimizer.param_groups):
+        group_name = param_group.get("name", f"group_{idx}")
+        lr_snapshot[group_name] = float(param_group["lr"])
+
+    return lr_snapshot
+
+
+def plot_and_save_learning_rates(
+    lr_history: dict[str, list[float]],
+    save_dir: str | Path,
+) -> None:
+    """Plot learning-rate evolution for each parameter group."""
+    save_dir_path = RESULTS_DIR / Path(save_dir)
+    save_dir_path.mkdir(parents=True, exist_ok=True)
+
+    if not lr_history:
+        return
+
+    plt.figure(figsize=(10, 6))
+    for group_name, values in lr_history.items():
+        epochs = range(1, len(values) + 1)
+        plt.plot(epochs, values, label=f"{group_name} LR")
+
+    plt.title("Learning Rate Evolution")
+    plt.xlabel("Epochs")
+    plt.ylabel("Learning Rate")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(save_dir_path / "learning_rate_evolution.png")
+    plt.close()
 
 
 # ---------------------------------------------------------------------------
@@ -473,6 +642,7 @@ def evaluate_model(
     macro_f1 = f1_score(
         all_true_labels,
         all_predictions,
+        labels=list(range(len(CLASS_NAMES))),
         average="macro",
         zero_division=0,
     )
@@ -621,15 +791,21 @@ def train(
         stochastic_depth_prob=config.stochastic_depth_prob,
     ).to(device)
 
+    start_with_fine_tuning = (
+        config.enable_backbone_finetuning and config.warmup_epochs == 0
+    )
+
     optimizer, scheduler, training_stage = build_optimizer(
         model,
         config,
-        full_fine_tune=False,
+        full_fine_tune=start_with_fine_tuning,
     )
 
     history_train_loss: list[float] = []
     history_val_loss: list[float] = []
     history_val_f1: list[float] = []
+    history_lr: dict[str, list[float]] = {}
+    history_stage: list[str] = []
 
     best_checkpoint = BestCheckpoint()
     epochs_without_improvement = 0
@@ -639,7 +815,11 @@ def train(
     progress_bar = tqdm(range(config.num_epochs), desc="Training Progress", unit="epoch")
 
     for epoch in progress_bar:
-        if config.enable_backbone_finetuning and epoch == config.warmup_epochs:
+        if (
+            config.enable_backbone_finetuning
+            and config.warmup_epochs > 0
+            and epoch == config.warmup_epochs
+        ):
             optimizer, scheduler, training_stage = build_optimizer(
                 model,
                 config,
@@ -652,6 +832,17 @@ def train(
             )
             print()
             print(f"Switching to {fine_tuning_description} at epoch {epoch + 1}.")
+
+        current_lrs = get_learning_rate_snapshot(optimizer)
+
+        for group_name in current_lrs:
+            if group_name not in history_lr:
+                history_lr[group_name] = [np.nan] * epoch
+
+        for group_name in history_lr:
+            history_lr[group_name].append(current_lrs.get(group_name, np.nan))
+
+        history_stage.append(training_stage)
 
         model.train()
         running_train_loss = 0.0
@@ -741,6 +932,11 @@ def train(
         best_checkpoint.confusion_matrix,
         CLASS_NAMES,
         save_dir=save_dir,
+    )
+
+    plot_and_save_learning_rates(
+    history_lr,
+    save_dir=save_dir,
     )
 
     return model, val_loader
