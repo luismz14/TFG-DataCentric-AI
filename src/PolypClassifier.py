@@ -14,7 +14,7 @@ class PolypClassifier(nn.Module):
 
     The model starts from ImageNet-pretrained weights, replaces the original
     classifier head and exposes helper methods so the training pipeline can move
-    from head-only training to partial or full backbone fine-tuning.
+    from head-only warm-up to full-network fine-tuning.
     """
 
     def __init__(
@@ -55,21 +55,6 @@ class PolypClassifier(nn.Module):
         """Keep the classification head trainable."""
         for param in self.backbone.classifier.parameters():
             param.requires_grad = True
-
-    def unfreeze_last_feature_blocks(self, num_blocks: int) -> None:
-        """Unfreeze only the last `num_blocks` EfficientNet feature blocks."""
-        self.freeze_backbone()
-        self.unfreeze_classifier()
-
-        total_blocks = len(self.backbone.features)
-        num_blocks = max(0, min(num_blocks, total_blocks))
-        first_trainable_block = total_blocks - num_blocks
-
-        for block_idx in range(first_trainable_block, total_blocks):
-            for param in self.backbone.features[block_idx].parameters():
-                param.requires_grad = True
-
-        self._frozen_feature_block_ids = set(range(first_trainable_block))
 
     def unfreeze_all(self) -> None:
         """Unfreeze the full network for end-to-end fine-tuning."""

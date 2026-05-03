@@ -56,7 +56,7 @@ REQUIRED_METADATA_COLUMNS = {*GROUP_COLUMNS, "histology", "filename"}
 # Slot = True is used to reduce memory and speed up attribute access.
 @dataclass(slots=True)
 class TrainingConfig:
-    """Default hyperparameters for the phase-1 baseline classifier."""
+    """Baseline hyperparameters fixed across the data-centric experiments."""
 
     # Split configuration.
     train_ratio: float = 0.80
@@ -68,12 +68,8 @@ class TrainingConfig:
     num_workers: int = 0
     num_epochs: int = 100
 
-    # Progressive fine-tuning. A short warm-up stabilises the new classifier
-    # head before pretrained convolutional features are updated.
-    warmup_epochs: int = 0
-    trainable_backbone_blocks: int = 3
-    enable_backbone_finetuning: bool = True
-    full_network_finetuning: bool = True
+    # The classifier head is warmed up before full-network fine-tuning.
+    warmup_epochs: int = 3
 
     # Learning rates. The head learns faster than the pretrained backbone to preserve transferable features 
     head_lr: float = 1e-3
@@ -88,14 +84,12 @@ class TrainingConfig:
 
     # Adaptive training control.
     scheduler_factor: float = 0.5
-    scheduler_patience: int = 2
-    early_stopping_patience: int = 10
+    scheduler_patience: int = 4
+    early_stopping_patience: int = 12
     min_lr: float = 1e-6
     gradient_clip_norm: float = 1.0
 
-    # Imbalance handling.
-    use_weighted_loss: bool = True
-    use_weighted_sampler: bool = False
+    # Imbalance handling shared by the weighted loss and weighted sampler.
     class_weight_exponent: float = 0.5
 
 
@@ -335,7 +329,7 @@ def build_weighted_sampler(
     train_metadata_df: pd.DataFrame,
     config: TrainingConfig,
 ) -> WeightedRandomSampler:
-    """Create a weighted sampler for optional rebalancing."""
+    """Create the weighted sampler used to rebalance training batches."""
     class_counts = get_class_counts(train_metadata_df).replace(0, 1)
     class_sampling_weights = (1.0 / class_counts) ** config.class_weight_exponent
     sample_weights = [
@@ -357,12 +351,8 @@ def build_dataloaders(
     config: TrainingConfig,
     device: torch.device,
 ) -> tuple[DataLoader, DataLoader]:
-    """Create dataloaders with the configured balancing strategy."""
-    sampler = (
-        build_weighted_sampler(train_metadata_df, config)
-        if config.use_weighted_sampler
-        else None
-    )
+    """Create train and validation dataloaders."""
+    sampler = build_weighted_sampler(train_metadata_df, config)
 
     dataloader_kwargs = {
         "batch_size": config.batch_size,
@@ -374,7 +364,6 @@ def build_dataloaders(
 
     train_loader = DataLoader(
         train_dataset,
-        shuffle=sampler is None,
         sampler=sampler,
         **dataloader_kwargs,
     )
@@ -406,113 +395,15 @@ def build_criterion(
     train_metadata_df: pd.DataFrame,
     config: TrainingConfig,
     device: torch.device,
-) -> tuple[nn.CrossEntropyLoss, torch.Tensor | None]:
-    """Create the loss function and return the effective class weights."""
-    loss_weights = None
-    if config.use_weighted_loss:
-        loss_weights = build_loss_weights(train_metadata_df, config).to(device)
+) -> tuple[nn.CrossEntropyLoss, torch.Tensor]:
+    """Create the weighted cross-entropy loss used by the baseline."""
+    loss_weights = build_loss_weights(train_metadata_df, config).to(device)
 
     criterion = nn.CrossEntropyLoss(
         weight=loss_weights,
         label_smoothing=config.label_smoothing,
     )
     return criterion, loss_weights
-
-
-def build_decay_parameter_groups(
-    model: PolypClassifier,
-    head_lr: float,
-    backbone_lr: float | None = None,
-    weight_decay: float = 0.0,
-) -> list[dict[str, object]]:
-    """Split trainable parameters into decay / no-decay groups.
-
-    - weight decay for conv/linear weights
-    - no weight decay for biases
-    - no weight decay for normalization layers (BatchNorm, LayerNorm, etc.)
-    """
-
-    normalization_layers = (
-        nn.BatchNorm1d,
-        nn.BatchNorm2d,
-        nn.BatchNorm3d,
-        nn.SyncBatchNorm,
-        nn.LayerNorm,
-        nn.GroupNorm,
-        nn.InstanceNorm1d,
-        nn.InstanceNorm2d,
-        nn.InstanceNorm3d,
-    )
-
-    backbone_decay = []
-    backbone_no_decay = []
-    head_decay = []
-    head_no_decay = []
-
-    for module_name, module in model.backbone.named_modules():
-        for param_name, param in module.named_parameters(recurse=False):
-            if not param.requires_grad:
-                continue
-
-            full_name = f"{module_name}.{param_name}" if module_name else param_name
-            is_head = full_name.startswith("classifier")
-            is_bias = param_name.endswith("bias")
-            is_norm = isinstance(module, normalization_layers)
-
-            if is_head:
-                if is_bias or is_norm:
-                    head_no_decay.append(param)
-                else:
-                    head_decay.append(param)
-            else:
-                if is_bias or is_norm:
-                    backbone_no_decay.append(param)
-                else:
-                    backbone_decay.append(param)
-
-    parameter_groups: list[dict[str, object]] = []
-
-    if backbone_decay:
-        parameter_groups.append(
-            {
-                "params": backbone_decay,
-                "lr": backbone_lr if backbone_lr is not None else head_lr,
-                "weight_decay": weight_decay,
-                "name": "backbone_decay",
-            }
-        )
-
-    if backbone_no_decay:
-        parameter_groups.append(
-            {
-                "params": backbone_no_decay,
-                "lr": backbone_lr if backbone_lr is not None else head_lr,
-                "weight_decay": 0.0,
-                "name": "backbone_no_decay",
-            }
-        )
-
-    if head_decay:
-        parameter_groups.append(
-            {
-                "params": head_decay,
-                "lr": head_lr,
-                "weight_decay": weight_decay,
-                "name": "head_decay",
-            }
-        )
-
-    if head_no_decay:
-        parameter_groups.append(
-            {
-                "params": head_no_decay,
-                "lr": head_lr,
-                "weight_decay": 0.0,
-                "name": "head_no_decay",
-            }
-        )
-
-    return parameter_groups
 
 
 def build_optimizer(
@@ -522,39 +413,27 @@ def build_optimizer(
 ) -> tuple[optim.Optimizer, optim.lr_scheduler.ReduceLROnPlateau, str]:
     """Create the optimiser and scheduler for the current training stage."""
     if full_fine_tune:
-        if config.full_network_finetuning:
-            model.unfreeze_all()
-            stage_name = "full_network"
-        else:
-            model.unfreeze_last_feature_blocks(config.trainable_backbone_blocks)
-            stage_name = f"last_{config.trainable_backbone_blocks}_blocks"
-
+        model.unfreeze_all()
+        stage_name = "full_network"
         parameter_groups = model.get_trainable_parameter_groups(
             head_lr=config.fine_tune_head_lr,
             backbone_lr=config.backbone_lr,
         )
-        if len(parameter_groups) == 1:
-            parameter_groups[0]["name"] = "head"
-        elif len(parameter_groups) == 2:
-            parameter_groups[0]["name"] = "backbone"
-            parameter_groups[1]["name"] = "head"
-
-        optimizer = optim.AdamW(parameter_groups, weight_decay=config.weight_decay)
     else:
         model.freeze_backbone()
         model.unfreeze_classifier()
         stage_name = "head_only"
-
         parameter_groups = model.get_trainable_parameter_groups(
             head_lr=config.head_lr
         )
-        if len(parameter_groups) == 1:
-            parameter_groups[0]["name"] = "head"
-        elif len(parameter_groups) == 2:
-            parameter_groups[0]["name"] = "backbone"
-            parameter_groups[1]["name"] = "head"
 
-        optimizer = optim.AdamW(parameter_groups, weight_decay=config.weight_decay)
+    if len(parameter_groups) == 1:
+        parameter_groups[0]["name"] = "head"
+    elif len(parameter_groups) == 2:
+        parameter_groups[0]["name"] = "backbone"
+        parameter_groups[1]["name"] = "head"
+
+    optimizer = optim.AdamW(parameter_groups, weight_decay=config.weight_decay)
 
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
@@ -775,15 +654,14 @@ def train(
     )
 
     criterion, loss_weights = build_criterion(train_metadata_df, config, device)
-    if loss_weights is not None:
-        print()
-        print(
-            "Loss weights:",
-            {
-                class_name: round(float(weight), 4)
-                for class_name, weight in zip(CLASS_NAMES, loss_weights.cpu())
-            },
-        )
+    print()
+    print(
+        "Loss weights:",
+        {
+            class_name: round(float(weight), 4)
+            for class_name, weight in zip(CLASS_NAMES, loss_weights.cpu())
+        },
+    )
 
     model = PolypClassifier(
         num_classes=len(CLASS_NAMES),
@@ -791,21 +669,16 @@ def train(
         stochastic_depth_prob=config.stochastic_depth_prob,
     ).to(device)
 
-    start_with_fine_tuning = (
-        config.enable_backbone_finetuning and config.warmup_epochs == 0
-    )
-
     optimizer, scheduler, training_stage = build_optimizer(
         model,
         config,
-        full_fine_tune=start_with_fine_tuning,
+        full_fine_tune=False,
     )
 
     history_train_loss: list[float] = []
     history_val_loss: list[float] = []
     history_val_f1: list[float] = []
     history_lr: dict[str, list[float]] = {}
-    history_stage: list[str] = []
 
     best_checkpoint = BestCheckpoint()
     epochs_without_improvement = 0
@@ -815,23 +688,14 @@ def train(
     progress_bar = tqdm(range(config.num_epochs), desc="Training Progress", unit="epoch")
 
     for epoch in progress_bar:
-        if (
-            config.enable_backbone_finetuning
-            and config.warmup_epochs > 0
-            and epoch == config.warmup_epochs
-        ):
+        if epoch == config.warmup_epochs:
             optimizer, scheduler, training_stage = build_optimizer(
                 model,
                 config,
                 full_fine_tune=True,
             )
-            fine_tuning_description = (
-                "full-network fine-tuning"
-                if config.full_network_finetuning
-                else f"partial backbone fine-tuning ({config.trainable_backbone_blocks} blocks)"
-            )
             print()
-            print(f"Switching to {fine_tuning_description} at epoch {epoch + 1}.")
+            print(f"Switching to full-network fine-tuning at epoch {epoch + 1}.")
 
         current_lrs = get_learning_rate_snapshot(optimizer)
 
@@ -841,8 +705,6 @@ def train(
 
         for group_name in history_lr:
             history_lr[group_name].append(current_lrs.get(group_name, np.nan))
-
-        history_stage.append(training_stage)
 
         model.train()
         running_train_loss = 0.0
@@ -856,8 +718,7 @@ def train(
             loss = criterion(predictions, labels)
             loss.backward()
 
-            if config.gradient_clip_norm > 0:
-                nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip_norm)
+            nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip_norm)
 
             optimizer.step()
             running_train_loss += loss.item()
