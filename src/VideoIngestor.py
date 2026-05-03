@@ -1,5 +1,7 @@
 import sys
 
+from dropbox_utils.manage_temp_video import delete_temp_video, download_video_to_temp
+
 sys.path.append("..")
 
 import shutil
@@ -34,6 +36,9 @@ class VideoIngestor:
         conf_threshold: float = 0.15,
         min_track_hits: int = 2,
         max_candidates_per_video: int = 5,
+        base_histology: str = "Adenoma",
+        base_candidates: int = 1,
+        candidate_exponent: float = 0.5,
     ):
         self.detector = YOLO(str(yolo_weights_path))
         self.output_dir = Path(output_dir)
@@ -45,6 +50,10 @@ class VideoIngestor:
         self.conf_threshold = conf_threshold
         self.min_track_hits = min_track_hits
         self.max_candidates_per_video = max_candidates_per_video
+        self.base_histology = base_histology
+        self.base_candidates = base_candidates
+        self.candidate_exponent = candidate_exponent
+        self.candidates_per_histology: dict[str, int] | None = None
 
     def process_clinical_video(
         self,
@@ -176,13 +185,13 @@ class VideoIngestor:
         return saved_filenames
 
     def _num_candidates_for_histology(self, histology: str) -> int:
-        hist = {
-            "Adenoma": 1,
-            "Sessile_serrated_adenoma": 2,
-            "Hyperplastic": 4,
-            "Adenocarcinoma": 6,
-        }
-        return hist.get(histology, -1)
+        if self.candidates_per_histology is None:
+            raise RuntimeError(
+                "candidates_per_histology has not been initialized. "
+                "Call augment_video_rows before processing clinical videos."
+            )
+
+        return self.candidates_per_histology.get(histology, -1)
 
     def augment_video_rows(
         self,
@@ -219,6 +228,9 @@ class VideoIngestor:
             metadata_df["elapsed_seconds"],
             errors="raise",
         )
+
+        self.candidates_per_histology = self._build_candidates_per_histology(metadata_df)
+        print("Candidates per histology:", self.candidates_per_histology)
 
         output_df = metadata_df.drop(
             columns=["elapsed_seconds", "video_filename"],
@@ -276,6 +288,40 @@ class VideoIngestor:
 
         new_rows_df = pd.DataFrame(new_rows, columns=output_df.columns)
         return pd.concat([output_df, new_rows_df], ignore_index=True)
+
+    def _build_candidates_per_histology(self, metadata_df: pd.DataFrame) -> dict[str, int]:
+        histology_order = [
+            "Adenoma",
+            "Sessile_serrated_adenoma",
+            "Hyperplastic",
+            "Adenocarcinoma",
+        ]
+        class_counts = (
+            metadata_df["histology"]
+            .value_counts()
+            .reindex(histology_order, fill_value=0)
+            .replace(0, 1)
+        )
+
+        if self.base_histology not in class_counts.index:
+            raise ValueError(f"Unknown base_histology: {self.base_histology}")
+
+        # Inverse-frequency weights give minority classes more frame candidates.
+        # The exponent softens the compensation strength.
+        weights = (
+            len(metadata_df) / (len(class_counts) * class_counts)
+        ) ** self.candidate_exponent
+        base_weight = weights[self.base_histology]
+
+        candidates_per_histology: dict[str, int] = {}
+        for histology in histology_order:
+            ratio = weights[histology] / base_weight
+            candidates = round(self.base_candidates * ratio)
+            # The maximum avoids too many redundant frames from the same video.
+            candidates = max(1, min(self.max_candidates_per_video, candidates))
+            candidates_per_histology[histology] = candidates
+
+        return candidates_per_histology
 
     def _crop_frame(self, frame, roi):
         x, y, w, h = roi
@@ -394,3 +440,131 @@ class VideoIngestor:
             end="",
             flush=True,
         )
+
+def augment_dataset(
+    yolo_weights_path: str | Path,
+    metadata_csv_path: str | Path = "data/phase2/unified_data_phase2.csv",
+    output_dir: str | Path = "data/phase2/framesv2",
+    output_csv_path: str | Path = "data/phase2/data_phase2_v2.csv",
+    max_candidates_per_video: int = 10,
+) -> dict[str, int | str]:
+    metadata_csv_path = Path(metadata_csv_path)
+    output_csv_path = Path(output_csv_path)
+
+    metadata_df = pd.read_csv(
+        metadata_csv_path,
+        dtype=str,
+        keep_default_na=False,
+    )
+
+    sorted_df = metadata_df.sort_values(
+        ["patient_id", "video_filename", "elapsed_seconds", "filename"]
+    ).reset_index(drop=True)
+
+    ingestor = VideoIngestor(
+        yolo_weights_path=yolo_weights_path,
+        output_dir=output_dir,
+        max_candidates_per_video=max_candidates_per_video,
+    )
+    
+    grouped = sorted_df.groupby(["patient_id", "video_filename"], sort=False)
+    total_videos = grouped.ngroups
+
+    augmented_groups = []
+    failed_groups = []
+
+    for video_index, ((patient_id, video_filename), video_rows_df) in enumerate(grouped, start=1):
+        print(f"\n[{video_index}/{total_videos}] Processing {patient_id} | {video_filename}")
+
+        local_video_path = download_video_to_temp(patient_id=patient_id, video_name=video_filename)
+        if local_video_path is None:
+            print("Skipping video because download failed.")
+            failed_groups.append(
+                {
+                    "patient_id": patient_id,
+                    "video_filename": video_filename,
+                    "video_rows_df": video_rows_df,
+                    "local_video_path": None,
+                }
+            )
+            continue
+
+        try:
+            augmented_video_df = ingestor.augment_video_rows(
+                video_path=local_video_path,
+                metadata_rows=video_rows_df,
+            )
+            augmented_groups.append(augmented_video_df)
+            delete_temp_video(local_video_path)
+        except Exception as error:
+            print(f"\nError at {patient_id} | {video_filename}: {error}")
+            failed_groups.append(
+                {
+                    "patient_id": patient_id,
+                    "video_filename": video_filename,
+                    "video_rows_df": video_rows_df,
+                    "local_video_path": local_video_path,
+                }
+            )
+
+    recovered_groups = []
+    still_failed_groups = []
+
+    if failed_groups:
+        print(f"\nRetrying {len(failed_groups)} failed videos after first pass...")
+
+    for retry_index, failed_group in enumerate(failed_groups, start=1):
+        patient_id = failed_group["patient_id"]
+        video_filename = failed_group["video_filename"]
+        video_rows_df = failed_group["video_rows_df"]
+        local_video_path = failed_group["local_video_path"]
+
+        print(f"\n[retry {retry_index}/{len(failed_groups)}] Processing {patient_id} | {video_filename}")
+
+        if local_video_path is None:
+            local_video_path = download_video_to_temp(patient_id=patient_id, video_name=video_filename)
+            if local_video_path is None:
+                print("Retry failed because the video could not be downloaded.")
+                still_failed_groups.append(
+                    {
+                        "patient_id": patient_id,
+                        "video_filename": video_filename,
+                        "local_video_path": None,
+                    }
+                )
+                continue
+
+        try:
+            augmented_video_df = ingestor.augment_video_rows(
+                video_path=local_video_path,
+                metadata_rows=video_rows_df,
+            )
+            recovered_groups.append(augmented_video_df)
+            delete_temp_video(local_video_path)
+        except Exception as error:
+            print(f"\nRetry failed for {patient_id} | {video_filename}: {error}")
+            print(f"Keeping local video for inspection: {local_video_path}")
+            still_failed_groups.append(
+                {
+                    "patient_id": patient_id,
+                    "video_filename": video_filename,
+                    "local_video_path": local_video_path,
+                }
+            )
+
+    all_groups = [*augmented_groups, *recovered_groups]
+    if all_groups:
+        augmented_df = pd.concat(all_groups, ignore_index=True)
+    else:
+        augmented_df = sorted_df.drop(columns=["elapsed_seconds", "video_filename"], errors="ignore")
+
+    output_csv_path.parent.mkdir(parents=True, exist_ok=True)
+    augmented_df.to_csv(output_csv_path, index=False, encoding="utf-8")
+
+    return {
+        "videos_processed_first_pass": len(augmented_groups),
+        "videos_recovered_second_pass": len(recovered_groups),
+        "videos_still_failed": len(still_failed_groups),
+        "rows_output": len(augmented_df),
+        "output_csv_path": str(output_csv_path),
+    }
