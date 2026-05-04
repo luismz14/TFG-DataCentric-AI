@@ -1,17 +1,22 @@
+import math
 import sys
-
-from dropbox_utils.manage_temp_video import delete_temp_video, download_video_to_temp
 
 sys.path.append("..")
 
-import shutil
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
 import pandas as pd
-from ultralytics import YOLO
+
+
+HISTOLOGY_ORDER = [
+    "Adenoma",
+    "Sessile_serrated_adenoma",
+    "Hyperplastic",
+    "Adenocarcinoma",
+]
 
 
 @dataclass
@@ -23,6 +28,106 @@ class ClinicalVideoRecord:
     F: str
     histology: str
     filename: str = ""
+
+
+def build_histology_candidate_summary(
+    metadata_rows: pd.DataFrame | list[dict],
+    candidates_per_histology: dict[str, int],
+) -> pd.DataFrame:
+    metadata_df = clean_histology_metadata_rows(metadata_rows)
+
+    class_counts = metadata_df["histology"].astype(str).value_counts()
+
+    summary_rows = []
+    for histology in HISTOLOGY_ORDER:
+        current_samples = int(class_counts.get(histology, 0))
+        max_candidates = candidates_per_histology.get(histology, -1)
+        max_added_per_sample = max(0, max_candidates)
+        max_added_samples = current_samples * max_added_per_sample
+
+        summary_rows.append(
+            {
+                "histology": histology,
+                "current_samples": current_samples,
+                "max_added_per_sample": max_added_per_sample,
+                "max_added_samples": max_added_samples,
+                "estimated_final_samples": current_samples + max_added_samples,
+            }
+        )
+
+    return pd.DataFrame(summary_rows)
+
+
+def clean_histology_metadata_rows(
+    metadata_rows: pd.DataFrame | list[dict],
+    *,
+    verbose: bool = False,
+) -> pd.DataFrame:
+    metadata_df = (
+        metadata_rows.copy()
+        if isinstance(metadata_rows, pd.DataFrame)
+        else pd.DataFrame(metadata_rows)
+    )
+
+    if "histology" not in metadata_df.columns:
+        raise ValueError("metadata_rows is missing required column: histology")
+
+    normalized_histology = metadata_df["histology"].astype(str).str.strip()
+    valid_mask = normalized_histology.isin(HISTOLOGY_ORDER)
+
+    if verbose and (~valid_mask).any():
+        invalid_counts = normalized_histology[~valid_mask].value_counts().to_dict()
+        print("Skipping rows with invalid histology:", invalid_counts)
+
+    cleaned_df = metadata_df.loc[valid_mask].copy()
+    cleaned_df["histology"] = normalized_histology.loc[valid_mask]
+    return cleaned_df.reset_index(drop=True)
+
+
+def print_histology_candidate_summary(
+    metadata_rows: pd.DataFrame | list[dict],
+    candidates_per_histology: dict[str, int],
+) -> pd.DataFrame:
+    metadata_df = clean_histology_metadata_rows(metadata_rows, verbose=True)
+    summary_df = build_histology_candidate_summary(
+        metadata_rows=metadata_df,
+        candidates_per_histology=candidates_per_histology,
+    )
+
+    print("Max candidates per histology:", candidates_per_histology)
+    print("Histology augmentation summary:")
+    print(summary_df.to_string(index=False))
+    print(
+        "Estimated totals: "
+        f"current_samples={summary_df['current_samples'].sum()}, "
+        f"max_added_samples={summary_df['max_added_samples'].sum()}, "
+        f"estimated_final_samples={summary_df['estimated_final_samples'].sum()}"
+    )
+
+    return summary_df
+
+
+def detect_clinical_area(
+    frame,
+    threshold: int = 15,
+    padding: int = 10,
+) -> tuple[int, int, int, int]:
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    _, thresh = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY)
+
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    if not contours:
+        return 0, 0, frame.shape[1], frame.shape[0]
+
+    x, y, w, h = cv2.boundingRect(max(contours, key=cv2.contourArea))
+
+    x = max(0, x - padding)
+    y = max(0, y - padding)
+    w = min(frame.shape[1] - x, w + 2 * padding)
+    h = min(frame.shape[0] - y, h + 2 * padding)
+
+    return x, y, w, h
 
 
 class VideoIngestor:
@@ -38,8 +143,10 @@ class VideoIngestor:
         max_candidates_per_video: int = 5,
         base_histology: str = "Adenoma",
         base_candidates: int = 1,
-        candidate_exponent: float = 0.5,
+        candidate_exponent: float = 1.0,
     ):
+        from ultralytics import YOLO
+
         self.detector = YOLO(str(yolo_weights_path))
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -223,14 +330,21 @@ class VideoIngestor:
                 "metadata_rows is missing required columns: " + ", ".join(missing_columns)
             )
 
-        metadata_df = metadata_df.copy()
+        metadata_df = clean_histology_metadata_rows(metadata_df, verbose=True)
+        if metadata_df.empty:
+            return metadata_df.drop(
+                columns=["elapsed_seconds", "video_filename"],
+                errors="ignore",
+            ).reset_index(drop=True)
+
         metadata_df["elapsed_seconds"] = pd.to_numeric(
             metadata_df["elapsed_seconds"],
             errors="raise",
         )
 
-        self.candidates_per_histology = self._build_candidates_per_histology(metadata_df)
-        print("Candidates per histology:", self.candidates_per_histology)
+        if self.candidates_per_histology is None:
+            self.candidates_per_histology = self._build_candidates_per_histology(metadata_df)
+            self.print_histology_candidate_summary(metadata_df)
 
         output_df = metadata_df.drop(
             columns=["elapsed_seconds", "video_filename"],
@@ -290,16 +404,14 @@ class VideoIngestor:
         return pd.concat([output_df, new_rows_df], ignore_index=True)
 
     def _build_candidates_per_histology(self, metadata_df: pd.DataFrame) -> dict[str, int]:
-        histology_order = [
-            "Adenoma",
-            "Sessile_serrated_adenoma",
-            "Hyperplastic",
-            "Adenocarcinoma",
-        ]
+        metadata_df = clean_histology_metadata_rows(metadata_df)
+        if metadata_df.empty:
+            raise ValueError("Cannot build candidates without valid histology rows.")
+
         class_counts = (
             metadata_df["histology"]
             .value_counts()
-            .reindex(histology_order, fill_value=0)
+            .reindex(HISTOLOGY_ORDER, fill_value=0)
             .replace(0, 1)
         )
 
@@ -314,38 +426,55 @@ class VideoIngestor:
         base_weight = weights[self.base_histology]
 
         candidates_per_histology: dict[str, int] = {}
-        for histology in histology_order:
+        for histology in HISTOLOGY_ORDER:
             ratio = weights[histology] / base_weight
-            candidates = round(self.base_candidates * ratio)
+            candidates = math.ceil(self.base_candidates * ratio)
             # The maximum avoids too many redundant frames from the same video.
             candidates = max(1, min(self.max_candidates_per_video, candidates))
             candidates_per_histology[histology] = candidates
 
         return candidates_per_histology
 
+    def build_histology_candidate_summary(
+        self,
+        metadata_rows: pd.DataFrame | list[dict],
+    ) -> pd.DataFrame:
+        if self.candidates_per_histology is None:
+            metadata_df = (
+                metadata_rows.copy()
+                if isinstance(metadata_rows, pd.DataFrame)
+                else pd.DataFrame(metadata_rows)
+            )
+            self.candidates_per_histology = self._build_candidates_per_histology(metadata_df)
+
+        return build_histology_candidate_summary(
+            metadata_rows=metadata_rows,
+            candidates_per_histology=self.candidates_per_histology,
+        )
+
+    def print_histology_candidate_summary(
+        self,
+        metadata_rows: pd.DataFrame | list[dict],
+    ) -> pd.DataFrame:
+        if self.candidates_per_histology is None:
+            metadata_df = (
+                metadata_rows.copy()
+                if isinstance(metadata_rows, pd.DataFrame)
+                else pd.DataFrame(metadata_rows)
+            )
+            self.candidates_per_histology = self._build_candidates_per_histology(metadata_df)
+
+        return print_histology_candidate_summary(
+            metadata_rows=metadata_rows,
+            candidates_per_histology=self.candidates_per_histology,
+        )
+
     def _crop_frame(self, frame, roi):
         x, y, w, h = roi
         return frame[y : y + h, x : x + w]
 
     def _detect_clinical_area(self, frame):
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        _, thresh = cv2.threshold(gray, 15, 255, cv2.THRESH_BINARY)
-
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        if not contours:
-            return 0, 0, frame.shape[1], frame.shape[0]
-
-        largest_contour = max(contours, key=cv2.contourArea)
-        x, y, w, h = cv2.boundingRect(largest_contour)
-
-        padding = 10
-        x = max(0, x - padding)
-        y = max(0, y - padding)
-        w = min(frame.shape[1] - x, w + 2 * padding)
-        h = min(frame.shape[0] - y, h + 2 * padding)
-
-        return x, y, w, h
+        return detect_clinical_area(frame)
 
     def _select_primary_track(self, track_store: dict, timestamp_frame: int) -> int | None:
         candidates = []
@@ -418,13 +547,8 @@ class VideoIngestor:
             raise ValueError(f"Could not read image from path: {source_path}")
 
         roi = self._detect_clinical_area(image)
-        x, y, w, h = roi
-
-        if (x, y, w, h) == (0, 0, image.shape[1], image.shape[0]):
-            shutil.copy2(source_path, destination_path)
-        else:
-            cropped = self._crop_frame(image, roi)
-            cv2.imwrite(str(destination_path), cropped)
+        cropped = self._crop_frame(image, roi)
+        cv2.imwrite(str(destination_path), cropped)
 
         return destination_path
 
@@ -456,6 +580,22 @@ def augment_dataset(
         dtype=str,
         keep_default_na=False,
     )
+    metadata_df = clean_histology_metadata_rows(metadata_df, verbose=True)
+
+    if metadata_df.empty:
+        output_df = metadata_df.drop(
+            columns=["elapsed_seconds", "video_filename"],
+            errors="ignore",
+        )
+        output_csv_path.parent.mkdir(parents=True, exist_ok=True)
+        output_df.to_csv(output_csv_path, index=False, encoding="utf-8")
+        return {
+            "videos_processed_first_pass": 0,
+            "videos_recovered_second_pass": 0,
+            "videos_still_failed": 0,
+            "rows_output": 0,
+            "output_csv_path": str(output_csv_path),
+        }
 
     sorted_df = metadata_df.sort_values(
         ["patient_id", "video_filename", "elapsed_seconds", "filename"]
@@ -466,6 +606,18 @@ def augment_dataset(
         output_dir=output_dir,
         max_candidates_per_video=max_candidates_per_video,
     )
+    ingestor.candidates_per_histology = ingestor._build_candidates_per_histology(sorted_df)
+    ingestor.print_histology_candidate_summary(sorted_df)
+
+    try:
+        from dropbox_utils.manage_temp_video import delete_temp_video, download_video_to_temp
+    except ModuleNotFoundError as error:
+        if error.name in {"dropbox", "dotenv"}:
+            raise ModuleNotFoundError(
+                "augment_dataset requires Dropbox dependencies. "
+                "Install them in this environment with: %pip install dropbox python-dotenv"
+            ) from error
+        raise
     
     grouped = sorted_df.groupby(["patient_id", "video_filename"], sort=False)
     total_videos = grouped.ngroups

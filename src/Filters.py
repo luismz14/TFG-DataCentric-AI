@@ -57,152 +57,120 @@ def add_darkness_values(
     return dataframe
 
 
-def compute_lumen_score(
+def compute_lumen_area_ratio(
     image: np.ndarray,
-    fov_radius_ratio: float = 0.92,
-    blur_ksize: int = 31,
-    dark_percentile: float = 12.0,
-    max_dark_intensity: float = 80.0,
-    min_area_ratio: float = 0.012,
-    min_mean_darkness: float = 0.58,
+    fov_radius_ratio: float = 0.88,
+    dark_threshold: int = 55,
+    blur_ksize: int = 21,
+    min_component_area_ratio: float = 0.01,
     border_margin_ratio: float = 0.05,
-    max_border_overlap_ratio: float = 0.35,
-    min_fill_ratio: float = 0.25,
-    min_circularity: float = 0.12,
+    max_border_overlap_ratio: float = 0.40,
 ) -> tuple[float, np.ndarray]:
     """
-    Estimate a lumen score for a frame.
-
-    The detector is intentionally simple and general:
-    - restrict the search to a circular field of view to ignore dark corners,
-    - segment dark regions after strong smoothing,
-    - evaluate every connected component instead of forcing a central seed,
-    - keep the dark component that is large, compact, and not mostly glued to
-    the border of the field of view.
+    Estimate the area ratio occupied by the largest valid dark component
+    compatible with intestinal lumen.
 
     Returns:
-    - lumen_score: large dark compact regions get higher values
-    - component_mask: binary mask of that component
+        lumen_area_ratio: area of selected component / useful FOV area.
+        component_mask: binary mask of the selected component.
     """
 
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    h, w = gray.shape
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    value = hsv[:, :, 2]
+
+    h, w = value.shape
     cx, cy = w // 2, h // 2
     max_r = min(h, w) // 2
 
     if max_r <= 0:
-        return 0.0, np.zeros_like(gray, dtype=np.uint8)
+        return 0.0, np.zeros_like(value, dtype=np.uint8)
 
+    # Useful central endoscopic field of view.
     fov_r = max(8, int(max_r * fov_radius_ratio))
-
-    fov_mask = np.zeros_like(gray, dtype=np.uint8)
+    fov_mask = np.zeros_like(value, dtype=np.uint8)
     cv2.circle(fov_mask, (cx, cy), fov_r, 255, -1)
 
-    smooth = cv2.GaussianBlur(gray, (blur_ksize, blur_ksize), 0)
+    # Smooth image to detect large dark regions instead of tiny texture.
+    if blur_ksize % 2 == 0:
+        blur_ksize += 1
 
-    valid_values = smooth[fov_mask > 0]
-    if valid_values.size == 0:
-        return 0.0, np.zeros_like(gray, dtype=np.uint8)
+    smooth = cv2.GaussianBlur(value, (blur_ksize, blur_ksize), 0)
 
-    dark_threshold = min(float(np.percentile(valid_values, dark_percentile)), max_dark_intensity)
+    # Segment truly dark regions inside the useful FOV.
+    dark_mask = np.zeros_like(value, dtype=np.uint8)
+    dark_mask[(smooth < dark_threshold) & (fov_mask > 0)] = 255
 
-    dark_mask = np.zeros_like(gray, dtype=np.uint8)
-    dark_mask[(smooth <= dark_threshold) & (fov_mask > 0)] = 255
+    # Remove small noise and connect nearby dark pixels.
+    kernel_size = max(3, int(round(min(h, w) * 0.02)))
+    if kernel_size % 2 == 0:
+        kernel_size += 1
 
-    kernel_base = max(3, int(round(min(h, w) * 0.012)))
-    if kernel_base % 2 == 0:
-        kernel_base += 1
-
-    close_kernel_size = max(kernel_base + 4, int(round(min(h, w) * 0.03)))
-    if close_kernel_size % 2 == 0:
-        close_kernel_size += 1
-
-    open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_base, kernel_base))
-    close_kernel = cv2.getStructuringElement(
+    kernel = cv2.getStructuringElement(
         cv2.MORPH_ELLIPSE,
-        (close_kernel_size, close_kernel_size),
+        (kernel_size, kernel_size),
     )
 
-    dark_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_OPEN, open_kernel, iterations=1)
-    dark_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_CLOSE, close_kernel, iterations=1)
+    dark_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    dark_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
 
     if cv2.countNonZero(dark_mask) == 0:
-        return 0.0, np.zeros_like(gray, dtype=np.uint8)
+        return 0.0, np.zeros_like(value, dtype=np.uint8)
 
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(dark_mask, connectivity=8)
-    fov_area = float(np.count_nonzero(fov_mask))
-
+    # Border ring to reject dark regions caused by the endoscopic frame border.
     border_margin_px = max(4, int(min(h, w) * border_margin_ratio))
     border_kernel = cv2.getStructuringElement(
         cv2.MORPH_ELLIPSE,
         (2 * border_margin_px + 1, 2 * border_margin_px + 1),
     )
+
     eroded_fov = cv2.erode(fov_mask, border_kernel, iterations=1)
     border_ring = cv2.subtract(fov_mask, eroded_fov)
 
-    best_score = 0.0
-    best_selection_score = 0.0
-    best_mask = np.zeros_like(gray, dtype=np.uint8)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        dark_mask,
+        connectivity=8,
+    )
+
+    fov_area = float(np.count_nonzero(fov_mask))
+    best_ratio = 0.0
+    best_mask = np.zeros_like(value, dtype=np.uint8)
 
     for label in range(1, num_labels):
         component_area = float(stats[label, cv2.CC_STAT_AREA])
         area_ratio = component_area / fov_area
 
-        if area_ratio < min_area_ratio:
+        if area_ratio < min_component_area_ratio:
             continue
 
-        component_mask = np.zeros_like(gray, dtype=np.uint8)
+        component_mask = np.zeros_like(value, dtype=np.uint8)
         component_mask[labels == label] = 255
 
-        mean_intensity = cv2.mean(smooth, mask=component_mask)[0]
-        mean_darkness = 1.0 - (mean_intensity / 255.0)
-
-        if mean_darkness < min_mean_darkness:
-            continue
-
-        component_w = int(stats[label, cv2.CC_STAT_WIDTH])
-        component_h = int(stats[label, cv2.CC_STAT_HEIGHT])
-        bbox_area = float(max(component_w * component_h, 1))
-        fill_ratio = component_area / bbox_area
-
-        if fill_ratio < min_fill_ratio:
-            continue
-
-        contours, _ = cv2.findContours(component_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        perimeter = cv2.arcLength(contours[0], True) if contours else 0.0
-        circularity = 0.0 if perimeter <= 0 else float(4.0 * np.pi * component_area / (perimeter * perimeter))
-
-        if circularity < min_circularity:
-            continue
-
-        border_overlap = float(cv2.countNonZero(cv2.bitwise_and(component_mask, border_ring)))
-        border_overlap_ratio = border_overlap / component_area
+        border_overlap = float(
+            cv2.countNonZero(cv2.bitwise_and(component_mask, border_ring))
+        )
+        border_overlap_ratio = border_overlap / max(component_area, 1.0)
 
         if border_overlap_ratio > max_border_overlap_ratio:
             continue
 
-        lumen_score = area_ratio * (0.6 + 0.4 * mean_darkness) * fill_ratio * max(circularity, 0.2)
-        selection_score = lumen_score * (1.0 - 0.35 * border_overlap_ratio)
-
-        if selection_score > best_selection_score:
-            best_selection_score = selection_score
-            best_score = lumen_score
+        if area_ratio > best_ratio:
+            best_ratio = area_ratio
             best_mask = component_mask
 
-    return float(best_score), best_mask
+    return float(best_ratio), best_mask
 
 
 def add_lumen_values(
     dataframe: pd.DataFrame,
     image_column: str = "filename",
-    output_column: str = "lumen_score",
+    output_column: str = "lumen_area_ratio",
     images_dir: str | Path = "data/phase2/frames",
 ) -> pd.DataFrame:
     """
-    Calculate the lumen score of each frame.
+    Calculate the lumen area ratio of each frame.
 
-    The stored value increases when a frame contains a large, dark, compact
-    lumen-like region inside the usable field of view.
+    The stored value is the relative area occupied by the largest valid dark
+    component compatible with intestinal lumen.
     """
 
     images_dir = Path(images_dir)
@@ -219,8 +187,8 @@ def add_lumen_values(
         if image is None or image.size == 0:
             raise ValueError(f"Could not read image from path: {image_path}")
 
-        lumen_score, _ = compute_lumen_score(image)
-        dataframe.at[index, output_column] = lumen_score
+        lumen_area_ratio, _ = compute_lumen_area_ratio(image)
+        dataframe.at[index, output_column] = lumen_area_ratio
 
     return dataframe
 
@@ -322,13 +290,13 @@ def evaluate_darkness_filter(
 
 
 def evaluate_lumen_filter(
-    lumen_score: float,
+    lumen_area_ratio: float,
     params: FilterParams | None = None,
 ) -> bool:
     """Return True when the image should be discarded by lumen."""
 
     params = params or FilterParams()
-    return float(lumen_score) > params.lumen_threshold
+    return float(lumen_area_ratio) > params.lumen_threshold
 
 
 def evaluate_uniformity_filter(
