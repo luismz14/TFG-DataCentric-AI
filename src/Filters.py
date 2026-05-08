@@ -238,12 +238,14 @@ def add_blur_values(
     output_column: str = "laplacian_variance",
     images_dir: str | Path = "data/phase2/frames",
     fov_radius_ratio: float = 0.8,
+    use_full_image: bool = True,
 ) -> pd.DataFrame:
     """
     Calculate the blur value of each frame and save it in the dataframe.
 
-    The stored value is the variance of the Laplacian in grayscale inside a
-    circular central field of view. Lower values indicate stronger blur.
+    The stored value is the variance of the Laplacian in grayscale. By default
+    it is computed over the full image, but it can also be restricted to a
+    circular central field of view.
     """
 
     images_dir = Path(images_dir)
@@ -261,18 +263,27 @@ def add_blur_values(
             raise ValueError(f"Could not read image from path: {image_path}")
 
         gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        height, width = gray_image.shape
-        center = (width // 2, height // 2)
-        radius = max(int(min(height, width) * 0.5 * fov_radius_ratio), 1)
 
-        fov_mask = np.zeros_like(gray_image, dtype=np.uint8)
-        cv2.circle(fov_mask, center, radius, 255, -1)
+        if use_full_image:
+            laplacian = cv2.Laplacian(gray_image, cv2.CV_64F)
+            laplacian_values = laplacian.flatten()
+            laplacian_variance = (
+                float(laplacian_values.var()) if laplacian_values.size else 0.0
+            )
+        else:
+            # Versión anterior con campo de visión central
+            height, width = gray_image.shape
+            center = (width // 2, height // 2)
+            radius = max(int(min(height, width) * 0.5 * fov_radius_ratio), 1)
 
-        laplacian = cv2.Laplacian(gray_image, cv2.CV_64F)
-        laplacian_values = laplacian[fov_mask > 0]
-        laplacian_variance = (
-            float(laplacian_values.var()) if laplacian_values.size else 0.0
-        )
+            fov_mask = np.zeros_like(gray_image, dtype=np.uint8)
+            cv2.circle(fov_mask, center, radius, 255, -1)
+
+            laplacian = cv2.Laplacian(gray_image, cv2.CV_64F)
+            laplacian_values = laplacian[fov_mask > 0]
+            laplacian_variance = (
+                float(laplacian_values.var()) if laplacian_values.size else 0.0
+            )
 
         dataframe.at[index, output_column] = laplacian_variance
 

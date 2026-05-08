@@ -18,6 +18,58 @@ HISTOLOGY_ORDER = [
     "Adenocarcinoma",
 ]
 
+PHASE2_OUTPUT_COLUMNS = [
+    "filename",
+    "histology",
+    "patient_id",
+    "day",
+    "R",
+    "F",
+    "video_filename",
+    "elapsed_seconds",
+    "source_type",
+    "detection_confidence",
+    "bbox_area_ratio",
+]
+
+_PHASE2_COLUMN_DEFAULTS = {
+    "filename": "",
+    "histology": "",
+    "patient_id": "",
+    "day": "",
+    "R": "",
+    "F": "",
+    "video_filename": "",
+    "elapsed_seconds": 0.0,
+    "source_type": "original",
+    "detection_confidence": 0.0,
+    "bbox_area_ratio": 0.0,
+}
+
+
+def _finalize_phase2_output_columns(output_df: pd.DataFrame) -> pd.DataFrame:
+    output_df = output_df.copy()
+
+    for column in PHASE2_OUTPUT_COLUMNS:
+        if column not in output_df.columns:
+            output_df[column] = _PHASE2_COLUMN_DEFAULTS[column]
+
+    source_type = output_df["source_type"].fillna("original")
+    output_df["source_type"] = source_type.mask(
+        source_type.astype(str).str.strip().eq(""),
+        "original",
+    )
+    output_df["detection_confidence"] = pd.to_numeric(
+        output_df["detection_confidence"],
+        errors="coerce",
+    ).fillna(0.0)
+    output_df["bbox_area_ratio"] = pd.to_numeric(
+        output_df["bbox_area_ratio"],
+        errors="coerce",
+    ).fillna(0.0)
+
+    return output_df.loc[:, PHASE2_OUTPUT_COLUMNS].reset_index(drop=True)
+
 
 @dataclass
 class ClinicalVideoRecord:
@@ -167,7 +219,8 @@ class VideoIngestor:
         video_path: str | Path,
         timestamp_sec: float,
         record: ClinicalVideoRecord,
-    ) -> list[str]:
+        video_filename: str,
+    ) -> list[dict]:
         if video_path is None:
             raise ValueError("video_path is None. Video download probably failed.")
 
@@ -200,7 +253,7 @@ class VideoIngestor:
             return []
 
         clinical_roi = None
-        track_store: dict[int, dict[str, list | int]] = {}
+        track_store: dict[int, dict] = {}
         frame_cache: dict[int, object] = {}
 
         # Reset YOLO internal predictor state so tracks do not leak across timestamps.
@@ -236,32 +289,47 @@ class VideoIngestor:
             if boxes_obj.id is None:
                 continue
 
-            if boxes_obj.conf is not None:
-                confs = boxes_obj.conf.cpu().numpy().tolist()
-            else:
-                confs = [0.0] * len(boxes_obj)
-
+            detection_metadata = self._extract_detection_metadata_from_boxes(
+                boxes_obj=boxes_obj,
+                image_shape=cropped.shape,
+            )
             track_ids = boxes_obj.id.int().cpu().tolist()
 
             for i, track_id in enumerate(track_ids):
-                conf = float(confs[i]) if i < len(confs) and confs[i] is not None else 0.0
+                metadata = (
+                    detection_metadata[i]
+                    if i < len(detection_metadata)
+                    else self._default_detection_metadata()
+                )
+                conf = metadata["detection_confidence"]
 
                 if track_id not in track_store:
                     track_store[track_id] = {
                         "hits": 0,
                         "frames": [],
                         "confs": [],
+                        "metadata_by_frame": {},
                     }
 
                 track_store[track_id]["hits"] += 1
                 track_store[track_id]["frames"].append(frame_idx)
                 track_store[track_id]["confs"].append(conf)
 
+                existing_metadata = track_store[track_id]["metadata_by_frame"].get(
+                    frame_idx
+                )
+                if (
+                    existing_metadata is None
+                    or metadata["detection_confidence"]
+                    > existing_metadata["detection_confidence"]
+                ):
+                    track_store[track_id]["metadata_by_frame"][frame_idx] = metadata
+
         cap.release()
 
         primary_track_id = self._select_primary_track(track_store, timestamp_frame)
         sequence_counter = 1
-        saved_filenames: list[str] = []
+        saved_frames: list[dict] = []
         max_candidates = self._num_candidates_for_histology(record.histology)
 
         if max_candidates <= 0:
@@ -276,7 +344,7 @@ class VideoIngestor:
             )
         else:
             selected_frames = self._select_fallback_frames(
-                sampled_indices=sampled_indices,
+                sampled_indices=sorted(frame_cache.keys()),
                 timestamp_frame=timestamp_frame,
                 max_candidates=max_candidates,
             )
@@ -285,11 +353,25 @@ class VideoIngestor:
             frame = frame_cache[frame_idx]
             filename = self._build_output_filename(record, sequence_counter)
             save_path = self._save_clean_frame(frame=frame, filename=filename)
+            detection_metadata = self._default_detection_metadata()
 
-            saved_filenames.append(save_path.name)
+            if primary_track_id is not None:
+                detection_metadata = track_store[primary_track_id][
+                    "metadata_by_frame"
+                ].get(frame_idx, detection_metadata)
+
+            saved_frames.append(
+                {
+                    "filename": save_path.name,
+                    "video_filename": video_filename,
+                    "elapsed_seconds": timestamp_sec,
+                    "source_type": "video_candidate",
+                    **detection_metadata,
+                }
+            )
             sequence_counter += 1
 
-        return saved_filenames
+        return saved_frames
 
     def _num_candidates_for_histology(self, histology: str) -> int:
         if self.candidates_per_histology is None:
@@ -312,7 +394,7 @@ class VideoIngestor:
         )
 
         if metadata_df.empty:
-            return metadata_df.copy()
+            return _finalize_phase2_output_columns(metadata_df)
 
         required_columns = {
             "patient_id",
@@ -322,6 +404,7 @@ class VideoIngestor:
             "F",
             "histology",
             "filename",
+            "video_filename",
             "elapsed_seconds",
         }
         missing_columns = sorted(required_columns - set(metadata_df.columns))
@@ -332,10 +415,7 @@ class VideoIngestor:
 
         metadata_df = clean_histology_metadata_rows(metadata_df, verbose=True)
         if metadata_df.empty:
-            return metadata_df.drop(
-                columns=["elapsed_seconds", "video_filename"],
-                errors="ignore",
-            ).reset_index(drop=True)
+            return _finalize_phase2_output_columns(metadata_df)
 
         metadata_df["elapsed_seconds"] = pd.to_numeric(
             metadata_df["elapsed_seconds"],
@@ -346,22 +426,35 @@ class VideoIngestor:
             self.candidates_per_histology = self._build_candidates_per_histology(metadata_df)
             self.print_histology_candidate_summary(metadata_df)
 
-        output_df = metadata_df.drop(
-            columns=["elapsed_seconds", "video_filename"],
-            errors="ignore",
-        ).reset_index(drop=True)
+        output_df = metadata_df.reset_index(drop=True).copy()
+        output_df["source_type"] = "original"
+        output_df["detection_confidence"] = 0.0
+        output_df["bbox_area_ratio"] = 0.0
 
         for original_filename in output_df["filename"].drop_duplicates():
-            self._copy_original_image(original_filename)
+            detection_metadata = self._copy_original_image(str(original_filename))
+            original_mask = output_df["filename"].astype(str).eq(str(original_filename))
+            output_df.loc[
+                original_mask,
+                "detection_confidence",
+            ] = detection_metadata["detection_confidence"]
+            output_df.loc[
+                original_mask,
+                "bbox_area_ratio",
+            ] = detection_metadata["bbox_area_ratio"]
+
+        output_df = _finalize_phase2_output_columns(output_df)
 
         total_rows = len(metadata_df)
-        new_rows: list[dict[str, str]] = []
+        new_rows: list[dict] = []
 
         for row_index, row in enumerate(metadata_df.to_dict(orient="records"), start=1):
             base_row = {
-                column: row[column]
-                for column in output_df.columns
-                if column != "filename"
+                "histology": row["histology"],
+                "patient_id": row["patient_id"],
+                "day": row["day"],
+                "R": row["R"],
+                "F": row["F"],
             }
             record = ClinicalVideoRecord(
                 patient_id=str(row["patient_id"]),
@@ -373,17 +466,18 @@ class VideoIngestor:
                 filename=str(row["filename"]),
             )
 
-            saved_filenames = self.process_clinical_video(
+            saved_frames = self.process_clinical_video(
                 video_path=video_path,
                 timestamp_sec=float(row["elapsed_seconds"]),
                 record=record,
+                video_filename=str(row["video_filename"]),
             )
 
-            for saved_filename in saved_filenames:
+            for frame_metadata in saved_frames:
                 new_rows.append(
                     {
                         **base_row,
-                        "filename": saved_filename,
+                        **frame_metadata,
                     }
                 )
 
@@ -400,8 +494,10 @@ class VideoIngestor:
         if not new_rows:
             return output_df
 
-        new_rows_df = pd.DataFrame(new_rows, columns=output_df.columns)
-        return pd.concat([output_df, new_rows_df], ignore_index=True)
+        new_rows_df = pd.DataFrame(new_rows, columns=PHASE2_OUTPUT_COLUMNS)
+        return _finalize_phase2_output_columns(
+            pd.concat([output_df, new_rows_df], ignore_index=True)
+        )
 
     def _build_candidates_per_histology(self, metadata_df: pd.DataFrame) -> dict[str, int]:
         metadata_df = clean_histology_metadata_rows(metadata_df)
@@ -476,6 +572,110 @@ class VideoIngestor:
     def _detect_clinical_area(self, frame):
         return detect_clinical_area(frame)
 
+    def _default_detection_metadata(self) -> dict[str, float]:
+        return {
+            "detection_confidence": 0.0,
+            "bbox_area_ratio": 0.0,
+        }
+
+    def _calculate_bbox_area_ratio(
+        self,
+        x1: float,
+        y1: float,
+        x2: float,
+        y2: float,
+        image_shape,
+    ) -> float:
+        if len(image_shape) < 2:
+            return 0.0
+
+        image_height, image_width = image_shape[:2]
+        image_area = float(image_height * image_width)
+        if image_area <= 0:
+            return 0.0
+
+        try:
+            coords = [float(value) for value in (x1, y1, x2, y2)]
+        except (TypeError, ValueError):
+            return 0.0
+
+        if not all(math.isfinite(value) for value in coords):
+            return 0.0
+
+        left = max(0.0, min(coords[0], coords[2]))
+        top = max(0.0, min(coords[1], coords[3]))
+        right = min(float(image_width), max(coords[0], coords[2]))
+        bottom = min(float(image_height), max(coords[1], coords[3]))
+
+        bbox_width = max(0.0, right - left)
+        bbox_height = max(0.0, bottom - top)
+        return (bbox_width * bbox_height) / image_area
+
+    def _extract_detection_metadata_from_boxes(
+        self,
+        boxes_obj,
+        image_shape,
+    ) -> list[dict[str, float]]:
+        if boxes_obj is None or len(boxes_obj) == 0:
+            return []
+
+        if boxes_obj.conf is not None:
+            confs = boxes_obj.conf.cpu().numpy().tolist()
+        else:
+            confs = [0.0] * len(boxes_obj)
+
+        if boxes_obj.xyxy is not None:
+            xyxy_values = boxes_obj.xyxy.cpu().numpy().tolist()
+        else:
+            xyxy_values = []
+
+        detection_metadata = []
+        for i in range(len(boxes_obj)):
+            conf = float(confs[i]) if i < len(confs) and confs[i] is not None else 0.0
+            if not math.isfinite(conf):
+                conf = 0.0
+
+            bbox_area_ratio = 0.0
+            if i < len(xyxy_values) and len(xyxy_values[i]) >= 4:
+                bbox_area_ratio = self._calculate_bbox_area_ratio(
+                    x1=xyxy_values[i][0],
+                    y1=xyxy_values[i][1],
+                    x2=xyxy_values[i][2],
+                    y2=xyxy_values[i][3],
+                    image_shape=image_shape,
+                )
+
+            detection_metadata.append(
+                {
+                    "detection_confidence": conf,
+                    "bbox_area_ratio": bbox_area_ratio,
+                }
+            )
+
+        return detection_metadata
+
+    def _get_best_detection_metadata(self, image) -> dict[str, float]:
+        results = self.detector.predict(
+            image,
+            conf=self.conf_threshold,
+            verbose=False,
+        )
+
+        if not results or len(results) == 0:
+            return self._default_detection_metadata()
+
+        detection_metadata = self._extract_detection_metadata_from_boxes(
+            boxes_obj=results[0].boxes,
+            image_shape=image.shape,
+        )
+        if not detection_metadata:
+            return self._default_detection_metadata()
+
+        return max(
+            detection_metadata,
+            key=lambda metadata: metadata["detection_confidence"],
+        )
+
     def _select_primary_track(self, track_store: dict, timestamp_frame: int) -> int | None:
         candidates = []
 
@@ -535,7 +735,7 @@ class VideoIngestor:
         cv2.imwrite(str(save_path), frame)
         return save_path
 
-    def _copy_original_image(self, filename: str) -> Path:
+    def _copy_original_image(self, filename: str) -> dict[str, float]:
         source_path = self.original_images_dir / filename
         if not source_path.exists():
             raise FileNotFoundError(f"Could not find original image: {source_path}")
@@ -548,9 +748,10 @@ class VideoIngestor:
 
         roi = self._detect_clinical_area(image)
         cropped = self._crop_frame(image, roi)
+        detection_metadata = self._get_best_detection_metadata(cropped)
         cv2.imwrite(str(destination_path), cropped)
 
-        return destination_path
+        return detection_metadata
 
     def _print_progress(
         self,
@@ -583,10 +784,7 @@ def augment_dataset(
     metadata_df = clean_histology_metadata_rows(metadata_df, verbose=True)
 
     if metadata_df.empty:
-        output_df = metadata_df.drop(
-            columns=["elapsed_seconds", "video_filename"],
-            errors="ignore",
-        )
+        output_df = _finalize_phase2_output_columns(metadata_df)
         output_csv_path.parent.mkdir(parents=True, exist_ok=True)
         output_df.to_csv(output_csv_path, index=False, encoding="utf-8")
         return {
@@ -706,9 +904,11 @@ def augment_dataset(
 
     all_groups = [*augmented_groups, *recovered_groups]
     if all_groups:
-        augmented_df = pd.concat(all_groups, ignore_index=True)
+        augmented_df = _finalize_phase2_output_columns(
+            pd.concat(all_groups, ignore_index=True)
+        )
     else:
-        augmented_df = sorted_df.drop(columns=["elapsed_seconds", "video_filename"], errors="ignore")
+        augmented_df = _finalize_phase2_output_columns(sorted_df)
 
     output_csv_path.parent.mkdir(parents=True, exist_ok=True)
     augmented_df.to_csv(output_csv_path, index=False, encoding="utf-8")
