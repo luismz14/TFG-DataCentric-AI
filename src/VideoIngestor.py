@@ -10,6 +10,8 @@ from pathlib import Path
 import cv2
 import pandas as pd
 
+from utils.common import read_csv, validate_required_columns, write_csv
+
 
 HISTOLOGY_ORDER = [
     "Adenoma",
@@ -396,7 +398,7 @@ class VideoIngestor:
         if metadata_df.empty:
             return _finalize_phase2_output_columns(metadata_df)
 
-        required_columns = {
+        required_columns = [
             "patient_id",
             "day",
             "hour",
@@ -406,12 +408,8 @@ class VideoIngestor:
             "filename",
             "video_filename",
             "elapsed_seconds",
-        }
-        missing_columns = sorted(required_columns - set(metadata_df.columns))
-        if missing_columns:
-            raise ValueError(
-                "metadata_rows is missing required columns: " + ", ".join(missing_columns)
-            )
+        ]
+        validate_required_columns(metadata_df, required_columns, "metadata_rows")
 
         metadata_df = clean_histology_metadata_rows(metadata_df, verbose=True)
         if metadata_df.empty:
@@ -776,7 +774,7 @@ def augment_dataset(
     metadata_csv_path = Path(metadata_csv_path)
     output_csv_path = Path(output_csv_path)
 
-    metadata_df = pd.read_csv(
+    metadata_df = read_csv(
         metadata_csv_path,
         dtype=str,
         keep_default_na=False,
@@ -785,8 +783,7 @@ def augment_dataset(
 
     if metadata_df.empty:
         output_df = _finalize_phase2_output_columns(metadata_df)
-        output_csv_path.parent.mkdir(parents=True, exist_ok=True)
-        output_df.to_csv(output_csv_path, index=False, encoding="utf-8")
+        write_csv(output_df, output_csv_path)
         return {
             "videos_processed_first_pass": 0,
             "videos_recovered_second_pass": 0,
@@ -910,8 +907,7 @@ def augment_dataset(
     else:
         augmented_df = _finalize_phase2_output_columns(sorted_df)
 
-    output_csv_path.parent.mkdir(parents=True, exist_ok=True)
-    augmented_df.to_csv(output_csv_path, index=False, encoding="utf-8")
+    write_csv(augmented_df, output_csv_path)
 
     return {
         "videos_processed_first_pass": len(augmented_groups),

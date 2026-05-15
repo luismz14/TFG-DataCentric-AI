@@ -27,6 +27,7 @@ from torchvision import transforms
 from tqdm import tqdm
 
 from .PolypClassifier import PolypClassifier
+from utils.common import read_csv, validate_required_columns
 
 
 # ---------------------------------------------------------------------------
@@ -45,8 +46,8 @@ CLASS_NAMES = [
 ]
 LABEL_MAP = {class_name: idx for idx, class_name in enumerate(CLASS_NAMES)}
 
-GROUP_COLUMNS = ("patient_id", "day", "R", "F")
-REQUIRED_METADATA_COLUMNS = {*GROUP_COLUMNS, "histology", "filename"}
+GROUP_COLUMNS = ["patient_id", "day", "R", "F"]
+REQUIRED_METADATA_COLUMNS = [*GROUP_COLUMNS, "histology", "filename"]
 
 
 # ---------------------------------------------------------------------------
@@ -132,14 +133,12 @@ def set_random_seed(seed: int) -> None:
 
 def load_metadata(metadata_path: str | Path) -> pd.DataFrame:
     """Load the training metadata and enforce the expected schema."""
-    metadata_df = pd.read_csv(metadata_path)
-
-    missing_columns = REQUIRED_METADATA_COLUMNS.difference(metadata_df.columns)
-    if missing_columns:
-        missing_columns_str = ", ".join(sorted(missing_columns))
-        raise ValueError(
-            f"Metadata file '{metadata_path}' is missing columns: {missing_columns_str}."
-        )
+    metadata_df = read_csv(metadata_path)
+    validate_required_columns(
+        metadata_df,
+        REQUIRED_METADATA_COLUMNS,
+        f"metadata file '{metadata_path}'",
+    )
 
     metadata_df = metadata_df.dropna(
         subset=[*GROUP_COLUMNS, "histology", "filename"]

@@ -6,11 +6,21 @@ import numpy as np
 import pandas as pd
 from skimage.metrics import structural_similarity
 
+from utils.common import read_csv, validate_required_columns, write_csv
+
 
 SIMILARITY_SIZE = (452, 254)  # width, height
+TEMPORAL_TOLERANCE_SECONDS = 2.0
 SSIM_THRESHOLD = 0.75
 PHASH_DISTANCE_THRESHOLD = 8
 
+# Maybe increase the confidece weight will improve the selection of good images (maybe 0.4 - 0.1 - 0.5) Test needed to confirm this.
+LAPLACIAN_WEIGHT = 0.50 
+BBOX_AREA_WEIGHT = 0.30
+DETECTION_CONFIDENCE_WEIGHT = 0.20
+
+
+# How can I select this values accurately? Random for first run
 TOP_K_BY_HISTOLOGY = {
     "Adenoma": 1,
     "Sessile_serrated_adenoma": 2,
@@ -22,36 +32,16 @@ TOP_K_BY_HISTOLOGY = {
 def phase4_handler(
     metadata_path: str | Path,
     images_dir: str | Path,
-    temporal_tolerance_seconds: float = 2.0,
-    ssim_threshold: float = 0.75,
-    phash_distance_threshold: int = 8,
-    similarity_size: tuple[int, int] = (452, 254),
-    top_k_by_histology: dict[str, int] | None = None,
-    default_top_k: int = 1,
-    laplacian_weight: float = 0.50,
-    bbox_area_weight: float = 0.30,
-    detection_confidence_weight: float = 0.20,
-    excel_sheet_name: str | int = 0,
-    metadata_read_kwargs: dict | None = None,
     output_path: str | Path | None = None,
 ) -> dict[str, object]:
     """
     Run the complete deduplication pipeline from a metadata table.
 
-    The function is intended to be called from a notebook with all experiment
-    parameters passed explicitly, so the run can be reproduced with different
-    input files, thresholds or selection rules.
+    The function is intended to be called from a notebook with only the input
+    and output paths. Phase constants are defined at the top of this file.
     """
 
-    if top_k_by_histology is None:
-        top_k_by_histology = {
-            "Adenoma": 1,
-            "Sessile_serrated_adenoma": 2,
-            "Hyperplastic": 2,
-            "Adenocarcinoma": 3,
-        }
-
-    required_columns = {
+    required_columns = [
         "filename",
         "histology",
         "patient_id",
@@ -63,100 +53,66 @@ def phase4_handler(
         "detection_confidence",
         "bbox_area_ratio",
         "laplacian_variance",
-    }
+    ]
 
     # 1. Load metadata
-    # Uses: _read_metadata_table
-    input_df = _read_metadata_table(
-        metadata_path=metadata_path,
-        excel_sheet_name=excel_sheet_name,
-        metadata_read_kwargs=metadata_read_kwargs,
-    )
+    input_df = read_csv(metadata_path)
 
     # 2. Validate required columns
-    # Uses: _validate_required_columns
-    _validate_required_columns(
-        dataframe=input_df,
-        required_columns=required_columns,
-        context="metadata",
-    )
+    validate_required_columns(input_df, required_columns, "metadata")
 
     # 3. Group comparable images by clinical identity and time
-    # Uses: add_temporal_groups
     grouped_df = add_temporal_groups(
         dataframe=input_df,
-        temporal_tolerance_seconds=temporal_tolerance_seconds,
     )
 
-    # 4. Compute visual similarity pairs
-    # Uses: compute_similarity_pairs
-    pairs_df = compute_similarity_pairs(
+    # 4. Calculate visual similarity between two images using SSIM and pHash, inside each temporal group
+    similarity_pairs_df = calculate_similarity(
         dataframe=grouped_df,
         images_dir=images_dir,
-        ssim_threshold=ssim_threshold,
-        phash_distance_threshold=phash_distance_threshold,
-        output_size=similarity_size,
     )
 
-    # 5. Build redundancy clusters
-    # Uses: add_redundancy_clusters
-    clustered_df = add_redundancy_clusters(
+    # 5. Group redundant pairs into redundancy groups
+    # If a -> b and b -> c, then a, b, c are in the same group, even if a !-> c.
+    redundancy_grouped_df = group_similar_pairs(
         dataframe=grouped_df,
-        pairs_dataframe=pairs_df,
+        similarity_pairs_df=similarity_pairs_df,
     )
 
-    # 6. Score image quality inside each cluster
-    # Uses: add_quality_scores
+    # 6. Score image quality inside each redundancy group
     scored_df = add_quality_scores(
-        dataframe=clustered_df,
-        laplacian_weight=laplacian_weight,
-        bbox_area_weight=bbox_area_weight,
-        detection_confidence_weight=detection_confidence_weight,
+        dataframe=redundancy_grouped_df,
     )
 
-    # 7. Select top-K images per cluster
-    # Uses: select_top_k_per_cluster
-    selected_df = select_top_k_per_cluster(
+    # 7. Select top-K images per redundancy group
+    selected_df = select_top_k_per_redundancy_group(
         dataframe=scored_df,
-        top_k_by_histology=top_k_by_histology,
-        default_top_k=default_top_k,
     )
 
     # 8. Prepare final outputs
-    # Adds: selected bool, se_queda, final_df, kept_df, summary
     selected_df["selected"] = selected_df["selected"].astype(bool)
-    selected_df["se_queda"] = selected_df["selected"]
     selected_df = selected_df.reset_index(drop=True)
-    final_df = selected_df[selected_df["se_queda"]].copy().reset_index(drop=True)
+    final_df = selected_df[selected_df["selected"]].copy().reset_index(drop=True)
     kept_df = final_df.copy()
 
-    summary = _build_run_summary(
+    summary = _create_summary(
         metadata_path=metadata_path,
         images_dir=images_dir,
         input_df=input_df,
         grouped_df=grouped_df,
-        pairs_df=pairs_df,
+        similarity_pairs_df=similarity_pairs_df,
         selected_df=selected_df,
         final_df=final_df,
-        temporal_tolerance_seconds=temporal_tolerance_seconds,
-        ssim_threshold=ssim_threshold,
-        phash_distance_threshold=phash_distance_threshold,
-        similarity_size=similarity_size,
-        top_k_by_histology=top_k_by_histology,
-        default_top_k=default_top_k,
-        laplacian_weight=laplacian_weight,
-        bbox_area_weight=bbox_area_weight,
-        detection_confidence_weight=detection_confidence_weight,
     )
 
     if output_path is not None:
-        _write_dataframe(final_df, output_path)
+        write_csv(final_df, output_path)
 
     return {
         "input_df": input_df,
         "grouped_df": grouped_df,
-        "pairs_df": pairs_df,
-        "clustered_df": clustered_df,
+        "similarity_pairs_df": similarity_pairs_df,
+        "redundancy_grouped_df": redundancy_grouped_df,
         "scored_df": scored_df,
         "selected_df": selected_df,
         "final_df": final_df,
@@ -167,7 +123,7 @@ def phase4_handler(
 
 def add_temporal_groups(
     dataframe: pd.DataFrame,
-    temporal_tolerance_seconds: float = 2.0,
+    temporal_tolerance_seconds: float = TEMPORAL_TOLERANCE_SECONDS,
 ) -> pd.DataFrame:
     """
     Group comparable images by clinical identity and elapsed time.
@@ -177,7 +133,7 @@ def add_temporal_groups(
     fixed tolerance.
     """
 
-    required_columns = {
+    required_columns = [
         "filename",
         "histology",
         "patient_id",
@@ -186,12 +142,9 @@ def add_temporal_groups(
         "F",
         "video_filename",
         "elapsed_seconds",
-    }
+    ]
 
-    missing_columns = required_columns - set(dataframe.columns)
-    if missing_columns:
-        missing_columns_str = ", ".join(sorted(missing_columns))
-        raise ValueError(f"Missing required columns for grouping: {missing_columns_str}")
+    validate_required_columns(dataframe, required_columns, "grouping")
 
     if temporal_tolerance_seconds < 0:
         raise ValueError("temporal_tolerance_seconds must be >= 0")
@@ -292,11 +245,7 @@ def compute_ssim_score(
     )
 
 
-def compute_phash(
-    image: np.ndarray,
-    hash_size: int = 8,
-    highfreq_factor: int = 4,
-) -> np.ndarray:
+def compute_phash(image: np.ndarray) -> np.ndarray:
     """
     Compute a perceptual hash using DCT.
     """
@@ -307,7 +256,9 @@ def compute_phash(
     if len(image.shape) == 3:
         image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-    img_size = hash_size * highfreq_factor
+    # Standard pHash setup: DCT on 32x32, then keep the low-frequency 8x8 block.
+    hash_size = 8
+    img_size = 32
     resized = cv2.resize(
         image,
         (img_size, img_size),
@@ -341,7 +292,7 @@ def compute_phash_distance(
     return int(np.count_nonzero(hash_a != hash_b))
 
 
-def compute_similarity_pairs_for_group(
+def calculate_similarity_pairs_for_group(
     group_df: pd.DataFrame,
     images_dir: str | Path,
     ssim_threshold: float = SSIM_THRESHOLD,
@@ -354,17 +305,12 @@ def compute_similarity_pairs_for_group(
     The function only reports similarity. It does not discard images.
     """
 
-    required_columns = {
+    required_columns = [
         "filename",
         "group_id",
-    }
+    ]
 
-    missing_columns = required_columns - set(group_df.columns)
-    if missing_columns:
-        missing_columns_str = ", ".join(sorted(missing_columns))
-        raise ValueError(
-            f"Missing required columns for similarity computation: {missing_columns_str}"
-        )
+    validate_required_columns(group_df, required_columns, "similarity computation")
 
     result_columns = [
         "group_id",
@@ -442,7 +388,7 @@ def compute_similarity_pairs_for_group(
     return pd.DataFrame(rows, columns=result_columns)
 
 
-def compute_similarity_pairs(
+def calculate_similarity(
     dataframe: pd.DataFrame,
     images_dir: str | Path,
     ssim_threshold: float = SSIM_THRESHOLD,
@@ -450,18 +396,15 @@ def compute_similarity_pairs(
     output_size: tuple[int, int] = SIMILARITY_SIZE,
 ) -> pd.DataFrame:
     """
-    Compute pairwise similarity inside each temporal group.
+    Calculate pairwise similarity inside each temporal group.
     """
 
-    required_columns = {
+    required_columns = [
         "filename",
         "group_id",
-    }
+    ]
 
-    missing_columns = required_columns - set(dataframe.columns)
-    if missing_columns:
-        missing_columns_str = ", ".join(sorted(missing_columns))
-        raise ValueError(f"Missing required columns for similarity: {missing_columns_str}")
+    validate_required_columns(dataframe, required_columns, "similarity")
 
     pairwise_results = []
 
@@ -469,7 +412,7 @@ def compute_similarity_pairs(
         if len(group_df) < 2:
             continue
 
-        group_pairs_df = compute_similarity_pairs_for_group(
+        group_pairs_df = calculate_similarity_pairs_for_group(
             group_df=group_df,
             images_dir=images_dir,
             ssim_threshold=ssim_threshold,
@@ -500,50 +443,50 @@ def compute_similarity_pairs(
     return pd.concat(pairwise_results, ignore_index=True)
 
 
-def add_redundancy_clusters(
+def group_similar_pairs(
     dataframe: pd.DataFrame,
-    pairs_dataframe: pd.DataFrame,
+    similarity_pairs_df: pd.DataFrame,
 ) -> pd.DataFrame:
     """
-    Turn redundant image pairs into connected clusters.
+    Group redundant image pairs into connected redundancy groups.
 
     Each image is a node, each redundant pair is an edge, and each connected
-    component is a cluster.
+    component is a redundancy group.
     """
 
-    required_dataframe_columns = {
+    required_dataframe_columns = [
         "filename",
         "group_id",
-    }
+    ]
 
-    missing_dataframe_columns = required_dataframe_columns - set(dataframe.columns)
-    if missing_dataframe_columns:
-        missing_columns_str = ", ".join(sorted(missing_dataframe_columns))
-        raise ValueError(
-            f"Missing required dataframe columns for clustering: {missing_columns_str}"
-        )
+    validate_required_columns(
+        dataframe,
+        required_dataframe_columns,
+        "dataframe for redundancy grouping",
+    )
 
-    required_pairs_columns = {
+    required_pairs_columns = [
         "group_id",
         "filename_a",
         "filename_b",
         "is_redundant",
-    }
+    ]
 
-    missing_pairs_columns = required_pairs_columns - set(pairs_dataframe.columns)
-    if missing_pairs_columns:
-        missing_columns_str = ", ".join(sorted(missing_pairs_columns))
-        raise ValueError(
-            f"Missing required pairwise columns for clustering: {missing_columns_str}"
-        )
+    validate_required_columns(
+        similarity_pairs_df,
+        required_pairs_columns,
+        "pairwise dataframe for redundancy grouping",
+    )
 
     df = dataframe.copy()
-    df["cluster_id"] = ""
-    df["cluster_index"] = -1
-    df["cluster_size"] = 1
-    df["is_singleton_cluster"] = True
+    df["redundancy_group_id"] = ""
+    df["redundancy_group_index"] = -1
+    df["redundancy_group_size"] = 1
+    df["is_singleton_redundancy_group"] = True
 
-    redundant_pairs_df = pairs_dataframe[pairs_dataframe["is_redundant"]].copy()
+    redundant_pairs_df = similarity_pairs_df[
+        similarity_pairs_df["is_redundant"]
+    ].copy()
 
     for group_id, group_df in df.groupby("group_id", sort=False):
         group_filenames = sorted(group_df["filename"].astype(str).unique().tolist())
@@ -563,76 +506,82 @@ def add_redundancy_clusters(
             if filename_a in parent and filename_b in parent:
                 _union(parent, filename_a, filename_b)
 
-        clusters_by_root: dict[str, list[str]] = {}
+        redundancy_groups_by_root: dict[str, list[str]] = {}
 
         for filename in group_filenames:
             root = _find_root(parent, filename)
-            clusters_by_root.setdefault(root, []).append(filename)
+            redundancy_groups_by_root.setdefault(root, []).append(filename)
 
-        clusters = sorted(
-            clusters_by_root.values(),
+        redundancy_groups = sorted(
+            redundancy_groups_by_root.values(),
             key=lambda filenames: min(filenames),
         )
 
-        filename_to_cluster_metadata = {}
+        filename_to_redundancy_group_metadata = {}
 
-        for cluster_index, cluster_filenames in enumerate(clusters):
-            cluster_id = f"{group_id}_C{cluster_index}"
-            cluster_size = len(cluster_filenames)
-            is_singleton = cluster_size == 1
+        for redundancy_group_index, redundancy_group_filenames in enumerate(
+            redundancy_groups
+        ):
+            redundancy_group_id = f"{group_id}_G{redundancy_group_index}"
+            redundancy_group_size = len(redundancy_group_filenames)
+            is_singleton = redundancy_group_size == 1
 
-            for filename in cluster_filenames:
-                filename_to_cluster_metadata[filename] = {
-                    "cluster_id": cluster_id,
-                    "cluster_index": cluster_index,
-                    "cluster_size": cluster_size,
-                    "is_singleton_cluster": is_singleton,
+            for filename in redundancy_group_filenames:
+                filename_to_redundancy_group_metadata[filename] = {
+                    "redundancy_group_id": redundancy_group_id,
+                    "redundancy_group_index": redundancy_group_index,
+                    "redundancy_group_size": redundancy_group_size,
+                    "is_singleton_redundancy_group": is_singleton,
                 }
 
         group_mask = df["group_id"].astype(str) == str(group_id)
 
         for row_index in df[group_mask].index:
             filename = str(df.at[row_index, "filename"])
-            metadata = filename_to_cluster_metadata[filename]
+            metadata = filename_to_redundancy_group_metadata[filename]
 
-            df.at[row_index, "cluster_id"] = metadata["cluster_id"]
-            df.at[row_index, "cluster_index"] = metadata["cluster_index"]
-            df.at[row_index, "cluster_size"] = metadata["cluster_size"]
-            df.at[row_index, "is_singleton_cluster"] = metadata["is_singleton_cluster"]
+            df.at[row_index, "redundancy_group_id"] = metadata["redundancy_group_id"]
+            df.at[row_index, "redundancy_group_index"] = metadata[
+                "redundancy_group_index"
+            ]
+            df.at[row_index, "redundancy_group_size"] = metadata[
+                "redundancy_group_size"
+            ]
+            df.at[row_index, "is_singleton_redundancy_group"] = metadata[
+                "is_singleton_redundancy_group"
+            ]
 
     return df
 
 
-def summarize_clusters(dataframe: pd.DataFrame) -> pd.DataFrame:
+def summarize_redundancy_groups(dataframe: pd.DataFrame) -> pd.DataFrame:
     """
-    Create a summary table of redundancy clusters.
+    Create a summary table of redundancy groups.
     """
 
-    required_columns = {
+    required_columns = [
         "group_id",
-        "cluster_id",
-        "cluster_size",
+        "redundancy_group_id",
+        "redundancy_group_size",
         "histology",
         "filename",
-    }
+    ]
 
-    missing_columns = required_columns - set(dataframe.columns)
-    if missing_columns:
-        missing_columns_str = ", ".join(sorted(missing_columns))
-        raise ValueError(
-            f"Missing required columns for cluster summary: {missing_columns_str}"
-        )
+    validate_required_columns(dataframe, required_columns, "redundancy group summary")
 
     summary_df = (
-        dataframe.groupby("cluster_id")
+        dataframe.groupby("redundancy_group_id")
         .agg(
             group_id=("group_id", "first"),
             histology=("histology", "first"),
-            cluster_size=("filename", "count"),
+            redundancy_group_size=("filename", "count"),
             filenames=("filename", lambda values: list(values.astype(str))),
         )
         .reset_index()
-        .sort_values(["cluster_size", "cluster_id"], ascending=[False, True])
+        .sort_values(
+            ["redundancy_group_size", "redundancy_group_id"],
+            ascending=[False, True],
+        )
         .reset_index(drop=True)
     )
 
@@ -641,30 +590,25 @@ def summarize_clusters(dataframe: pd.DataFrame) -> pd.DataFrame:
 
 def add_quality_scores(
     dataframe: pd.DataFrame,
-    laplacian_weight: float = 0.50,
-    bbox_area_weight: float = 0.30,
-    detection_confidence_weight: float = 0.20,
+    laplacian_weight: float = LAPLACIAN_WEIGHT,
+    bbox_area_weight: float = BBOX_AREA_WEIGHT,
+    detection_confidence_weight: float = DETECTION_CONFIDENCE_WEIGHT,
 ) -> pd.DataFrame:
     """
-    Score each image inside its redundancy cluster.
+    Score each image inside its redundancy group.
 
     The score combines sharpness, visible lesion area and detector confidence.
     """
 
-    required_columns = {
+    required_columns = [
         "filename",
-        "cluster_id",
+        "redundancy_group_id",
         "laplacian_variance",
         "bbox_area_ratio",
         "detection_confidence",
-    }
+    ]
 
-    missing_columns = required_columns - set(dataframe.columns)
-    if missing_columns:
-        missing_columns_str = ", ".join(sorted(missing_columns))
-        raise ValueError(
-            f"Missing required columns for quality scoring: {missing_columns_str}"
-        )
+    validate_required_columns(dataframe, required_columns, "quality scoring")
 
     weights = {
         "laplacian_variance": laplacian_weight,
@@ -689,12 +633,14 @@ def add_quality_scores(
 
     df["quality_score"] = 0.0
 
-    for _, cluster_indices in df.groupby("cluster_id", sort=False).groups.items():
-        cluster_indices = list(cluster_indices)
+    for _, group_indices in df.groupby(
+        "redundancy_group_id", sort=False
+    ).groups.items():
+        group_indices = list(group_indices)
 
         for metric in weights:
-            df.loc[cluster_indices, f"norm_{metric}"] = _min_max_normalize_series(
-                df.loc[cluster_indices, metric]
+            df.loc[group_indices, f"norm_{metric}"] = _min_max_normalize_series(
+                df.loc[group_indices, metric]
             )
 
     df["quality_score"] = sum(
@@ -705,53 +651,51 @@ def add_quality_scores(
     return df
 
 
-def select_top_k_per_cluster(
+def select_top_k_per_redundancy_group(
     dataframe: pd.DataFrame,
-    top_k_by_histology: dict[str, int],
-    default_top_k: int = 1,
+    top_k_by_histology: dict[str, int] | None = None,
 ) -> pd.DataFrame:
     """
-    Select the best images from each redundancy cluster.
+    Select the best images from each redundancy group.
 
-    The number of kept images is selected from the cluster histology. If the
-    histology is not present in top_k_by_histology, default_top_k is used.
+    The number of kept images is selected from the redundancy group histology.
     """
 
-    required_columns = {
+    required_columns = [
         "filename",
         "histology",
-        "cluster_id",
+        "redundancy_group_id",
         "quality_score",
         "laplacian_variance",
         "bbox_area_ratio",
         "detection_confidence",
-    }
+    ]
 
-    missing_columns = required_columns - set(dataframe.columns)
-    if missing_columns:
-        missing_columns_str = ", ".join(sorted(missing_columns))
-        raise ValueError(
-            f"Missing required columns for top-K selection: {missing_columns_str}"
-        )
+    validate_required_columns(dataframe, required_columns, "top-K selection")
 
-    if default_top_k < 1:
-        raise ValueError("default_top_k must be >= 1")
+    if top_k_by_histology is None:
+        top_k_by_histology = TOP_K_BY_HISTOLOGY
 
     for histology, top_k in top_k_by_histology.items():
         if top_k < 1:
             raise ValueError(f"top_k for histology '{histology}' must be >= 1")
 
     df = dataframe.copy()
-    df["top_k"] = default_top_k
-    df["quality_rank_in_cluster"] = -1
+    df["top_k"] = 0
+    df["quality_rank_in_redundancy_group"] = -1
     df["selected"] = False
     df["discard_reason"] = "redundant_lower_quality"
 
-    for _, cluster_df in df.groupby("cluster_id", sort=False):
-        histology = str(cluster_df["histology"].iloc[0])
-        top_k = int(top_k_by_histology.get(histology, default_top_k))
+    for _, group_df in df.groupby("redundancy_group_id", sort=False):
+        histology = str(group_df["histology"].iloc[0])
+        if histology not in top_k_by_histology:
+            raise ValueError(
+                f"Missing top_k configuration for histology '{histology}'."
+            )
 
-        cluster_sorted = cluster_df.sort_values(
+        top_k = int(top_k_by_histology[histology])
+
+        group_sorted = group_df.sort_values(
             by=[
                 "quality_score",
                 "laplacian_variance",
@@ -763,11 +707,11 @@ def select_top_k_per_cluster(
             kind="mergesort",
         )
 
-        selected_indices = cluster_sorted.head(top_k).index
+        selected_indices = group_sorted.head(top_k).index
 
-        for rank, row_index in enumerate(cluster_sorted.index, start=1):
+        for rank, row_index in enumerate(group_sorted.index, start=1):
             df.at[row_index, "top_k"] = top_k
-            df.at[row_index, "quality_rank_in_cluster"] = rank
+            df.at[row_index, "quality_rank_in_redundancy_group"] = rank
 
         df.loc[selected_indices, "selected"] = True
         df.loc[selected_indices, "discard_reason"] = "selected"
@@ -789,64 +733,19 @@ def _load_similarity_view(
     return build_similarity_view(image=image, output_size=output_size)
 
 
-def _read_metadata_table(
-    metadata_path: str | Path,
-    excel_sheet_name: str | int,
-    metadata_read_kwargs: dict | None,
-) -> pd.DataFrame:
-    metadata_path = Path(metadata_path)
-    suffix = metadata_path.suffix.lower()
-    read_kwargs = {} if metadata_read_kwargs is None else dict(metadata_read_kwargs)
-
-    if suffix == ".csv":
-        return pd.read_csv(metadata_path, **read_kwargs)
-
-    if suffix in {".xls", ".xlsx", ".xlsm"}:
-        read_kwargs.setdefault("sheet_name", excel_sheet_name)
-        return pd.read_excel(metadata_path, **read_kwargs)
-
-    raise ValueError(
-        "metadata_path must be a CSV or Excel file "
-        f"(.csv, .xls, .xlsx, .xlsm). Got: {metadata_path}"
-    )
-
-
-def _validate_required_columns(
-    dataframe: pd.DataFrame,
-    required_columns: set[str],
-    context: str,
-) -> None:
-    missing_columns = required_columns - set(dataframe.columns)
-
-    if not missing_columns:
-        return
-
-    missing_columns_str = ", ".join(sorted(missing_columns))
-    raise ValueError(f"Missing required columns in {context}: {missing_columns_str}")
-
-
-def _build_run_summary(
+def _create_summary(
     metadata_path: str | Path,
     images_dir: str | Path,
     input_df: pd.DataFrame,
     grouped_df: pd.DataFrame,
-    pairs_df: pd.DataFrame,
+    similarity_pairs_df: pd.DataFrame,
     selected_df: pd.DataFrame,
     final_df: pd.DataFrame,
-    temporal_tolerance_seconds: float,
-    ssim_threshold: float,
-    phash_distance_threshold: int,
-    similarity_size: tuple[int, int],
-    top_k_by_histology: dict[str, int],
-    default_top_k: int,
-    laplacian_weight: float,
-    bbox_area_weight: float,
-    detection_confidence_weight: float,
 ) -> dict[str, object]:
-    if pairs_df.empty:
+    if similarity_pairs_df.empty:
         redundant_pairs = 0
     else:
-        redundant_pairs = int(pairs_df["is_redundant"].sum())
+        redundant_pairs = int(similarity_pairs_df["is_redundant"].sum())
 
     removed_images = len(selected_df) - len(final_df)
 
@@ -855,42 +754,12 @@ def _build_run_summary(
         "images_dir": str(images_dir),
         "input_images": len(input_df),
         "temporal_groups": int(grouped_df["group_id"].nunique()),
-        "comparable_pairs": len(pairs_df),
+        "comparable_pairs": len(similarity_pairs_df),
         "redundant_pairs": redundant_pairs,
-        "clusters": int(selected_df["cluster_id"].nunique()),
+        "redundancy_groups": int(selected_df["redundancy_group_id"].nunique()),
         "kept_images": len(final_df),
         "removed_images": removed_images,
-        "temporal_tolerance_seconds": temporal_tolerance_seconds,
-        "ssim_threshold": ssim_threshold,
-        "phash_distance_threshold": phash_distance_threshold,
-        "similarity_size": similarity_size,
-        "top_k_by_histology": dict(top_k_by_histology),
-        "default_top_k": default_top_k,
-        "quality_weights": {
-            "laplacian_variance": laplacian_weight,
-            "bbox_area_ratio": bbox_area_weight,
-            "detection_confidence": detection_confidence_weight,
-        },
     }
-
-
-def _write_dataframe(dataframe: pd.DataFrame, output_path: str | Path) -> None:
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    suffix = output_path.suffix.lower()
-
-    if suffix == ".csv":
-        dataframe.to_csv(output_path, index=False)
-        return
-
-    if suffix in {".xls", ".xlsx", ".xlsm"}:
-        dataframe.to_excel(output_path, index=False)
-        return
-
-    raise ValueError(
-        "output_path must be a CSV or Excel file "
-        f"(.csv, .xls, .xlsx, .xlsm). Got: {output_path}"
-    )
 
 
 def _find_root(parent: dict[str, str], item: str) -> str:

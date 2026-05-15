@@ -6,6 +6,7 @@ from pathlib import Path
 import pandas as pd
 
 import src.Filters as Filter
+from utils.common import read_csv
 
 
 FILTER_ORDER = ("darkness", "lumen", "uniformity", "blur")
@@ -68,7 +69,7 @@ def apply_phase3_filters(
     if csv_path.suffix.lower() != ".csv":
         raise ValueError("`csv_path` must point to a CSV file.")
 
-    dataframe = pd.read_csv(csv_path)
+    dataframe = read_csv(csv_path)
 
     if enabled_filters[0]:
         dataframe = _ensure_metric_column(

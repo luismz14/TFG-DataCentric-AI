@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from utils.common import read_csv, write_csv
+
 
 VIDEO_FILENAME_RE = re.compile(
     r"^(?P<day>\d{8})_(?P<hour>\d{6})_(?P<R>R\d+)_(?P<uid>[^.]+)\.(?P<ext>mp4|avi|mov)$",
@@ -116,7 +118,7 @@ def generate_phase2_baseline_with_video(
         else phase2_dir / "unified_data_baseline_phase2.csv"
     )
 
-    baseline_df = pd.read_csv(
+    baseline_df = read_csv(
         baseline_csv_path,
         dtype=str,
         encoding="utf-8-sig",
@@ -147,8 +149,7 @@ def generate_phase2_baseline_with_video(
     ]
     output_df = result_df[output_columns]
 
-    output_csv_path.parent.mkdir(parents=True, exist_ok=True)
-    output_df.to_csv(output_csv_path, index=False, encoding="utf-8")
+    write_csv(output_df, output_csv_path)
 
     return True
 

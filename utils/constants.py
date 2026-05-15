@@ -14,7 +14,7 @@ BASELINE_CONFIG = ModelTrain.TrainingConfig(
     num_epochs=100,
 
     warmup_epochs=3,
-    head_lr=1e-3,
+    head_lr=1e-3, 
     fine_tune_head_lr=1e-4,
     backbone_lr=1e-5,
 
