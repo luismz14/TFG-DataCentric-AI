@@ -3,7 +3,6 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import fields
 from pathlib import Path
-import inspect
 
 import numpy as np
 import torch
@@ -20,26 +19,6 @@ import src.ModelTrain as ModelTrain
 def _clone_config(config: ModelTrain.TrainingConfig) -> ModelTrain.TrainingConfig:
     return ModelTrain.TrainingConfig(
         **{field.name: getattr(config, field.name) for field in fields(config)}
-    )
-
-
-def _perform_split(
-    metadata_path: str | Path,
-    train_ratio: float,
-    random_state: int,
-):
-    split_signature = inspect.signature(ModelTrain.perform_clinical_data_split)
-
-    if "random_state" in split_signature.parameters:
-        return ModelTrain.perform_clinical_data_split(
-            metadata_path,
-            train_ratio=train_ratio,
-            random_state=random_state,
-        )
-
-    return ModelTrain.perform_clinical_data_split(
-        metadata_path,
-        train_ratio=train_ratio,
     )
 
 
@@ -89,10 +68,26 @@ def _flatten_report_metrics(report_dict: dict[str, object]) -> dict[str, float]:
     return flattened
 
 
+def _build_validation_loader(
+    validation_csv_dir: str | Path,
+    validation_img_dir: str | Path,
+    config: ModelTrain.TrainingConfig,
+    device: torch.device,
+):
+    val_metadata_df = ModelTrain.load_metadata(validation_csv_dir)
+    _, val_transform = ModelTrain.build_transforms(config)
+    val_dataset = ModelTrain.PolypDataset(
+        val_metadata_df,
+        images_dir=ModelTrain.resolve_data_path(validation_img_dir),
+        transform=val_transform,
+    )
+    return ModelTrain.build_validation_dataloader(val_dataset, config, device)
+
+
 def _evaluate_results_dir(
     results_dir: str | Path,
-    phase_csv_dir: str | Path,
-    phase_img_dir: str | Path,
+    validation_csv_dir: str | Path,
+    validation_img_dir: str | Path,
     config: ModelTrain.TrainingConfig,
 ) -> dict[str, float | str]:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -105,25 +100,9 @@ def _evaluate_results_dir(
     if not weights_path.exists():
         raise FileNotFoundError(f"Model weights not found: {weights_path}")
 
-    metadata_path = ModelTrain.DATA_DIR / Path(phase_csv_dir)
-    images_dir = ModelTrain.DATA_DIR / Path(phase_img_dir)
-
-    train_metadata_df, val_metadata_df = _perform_split(
-        metadata_path=metadata_path,
-        train_ratio=config.train_ratio,
-        random_state=config.random_state,
-    )
-
-    train_dataset, val_dataset = ModelTrain.build_datasets(
-        train_metadata_df,
-        val_metadata_df,
-        images_dir=images_dir,
-        config=config,
-    )
-    _, validation_loader = ModelTrain.build_dataloaders(
-        train_dataset,
-        val_dataset,
-        train_metadata_df=train_metadata_df,
+    validation_loader = _build_validation_loader(
+        validation_csv_dir=validation_csv_dir,
+        validation_img_dir=validation_img_dir,
         config=config,
         device=device,
     )
@@ -181,8 +160,8 @@ def _evaluate_results_dir(
 
 def print_results_metrics_summary(
     results_dirs: Sequence[str | Path],
-    phase_csv_dir: str | Path,
-    phase_img_dir: str | Path,
+    validation_csv_dir: str | Path,
+    validation_img_dir: str | Path,
     training_config: ModelTrain.TrainingConfig,
     random_states: Sequence[int] | None = None,
 ) -> None:
@@ -203,8 +182,8 @@ def print_results_metrics_summary(
         per_run_metrics.append(
             _evaluate_results_dir(
                 results_dir=results_dir,
-                phase_csv_dir=phase_csv_dir,
-                phase_img_dir=phase_img_dir,
+                validation_csv_dir=validation_csv_dir,
+                validation_img_dir=validation_img_dir,
                 config=config,
             )
         )
@@ -223,4 +202,3 @@ def print_results_metrics_summary(
         mean_value = float(values.mean())
         std_value = float(values.std(ddof=1)) if len(values) > 1 else float("nan")
         print(f"{metric_name}: mean={mean_value:.4f}, std={std_value:.4f}")
-

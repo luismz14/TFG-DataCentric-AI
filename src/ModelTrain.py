@@ -27,7 +27,7 @@ from torchvision import transforms
 from tqdm import tqdm
 
 from .PolypClassifier import PolypClassifier
-from utils.common import read_csv, validate_required_columns
+from utils.common import read_csv, validate_required_columns, write_csv
 
 
 # ---------------------------------------------------------------------------
@@ -59,7 +59,7 @@ REQUIRED_METADATA_COLUMNS = [*GROUP_COLUMNS, "histology", "filename"]
 class TrainingConfig:
     """Baseline hyperparameters fixed across the data-centric experiments."""
 
-    # Split configuration.
+    # Static split creation only; training receives explicit train/validation CSVs.
     train_ratio: float = 0.80
     random_state: int = 42
 
@@ -131,8 +131,22 @@ def set_random_seed(seed: int) -> None:
 # ---------------------------------------------------------------------------
 
 
+def resolve_data_path(path: str | Path) -> Path:
+    """Resolve paths consistently against the project data directory."""
+    path = Path(path)
+
+    if path.is_absolute():
+        return path
+
+    if path.parts and path.parts[0].lower() == "data":
+        return PROJECT_ROOT / path
+
+    return DATA_DIR / path
+
+
 def load_metadata(metadata_path: str | Path) -> pd.DataFrame:
     """Load the training metadata and enforce the expected schema."""
+    metadata_path = resolve_data_path(metadata_path)
     metadata_df = read_csv(metadata_path)
     validate_required_columns(
         metadata_df,
@@ -207,6 +221,33 @@ def perform_clinical_data_split(
 
     train_df = metadata_df.iloc[train_indices].reset_index(drop=True)
     val_df = metadata_df.iloc[val_indices].reset_index(drop=True)
+    return train_df, val_df
+
+
+def split_train_validation(
+    source_csv_name: str | Path,
+    train_csv_name: str | Path,
+    validation_csv_name: str | Path,
+    train_ratio: float = 0.80,
+    random_state: int = 42,
+    overwrite: bool = False,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Create or load the fixed train/validation CSVs used by all phases."""
+    train_csv_path = resolve_data_path(train_csv_name)
+    validation_csv_path = resolve_data_path(validation_csv_name)
+
+    if train_csv_path.exists() and validation_csv_path.exists() and not overwrite:
+        train_df = load_metadata(train_csv_path)
+        val_df = load_metadata(validation_csv_path)
+        return train_df, val_df
+
+    train_df, val_df = perform_clinical_data_split(
+        source_csv_name,
+        train_ratio=train_ratio,
+        random_state=random_state,
+    )
+    write_csv(train_df, train_csv_path)
+    write_csv(val_df, validation_csv_path)
     return train_df, val_df
 
 
@@ -307,18 +348,23 @@ def build_datasets(
     val_metadata_df: pd.DataFrame,
     images_dir: str | Path,
     config: TrainingConfig,
+    val_images_dir: str | Path | None = None,
 ) -> tuple[PolypDataset, PolypDataset]:
     """Create the train and validation datasets."""
     train_transforms, val_transforms = build_transforms(config)
+    train_images_dir = Path(images_dir)
+    validation_images_dir = (
+        Path(val_images_dir) if val_images_dir is not None else train_images_dir
+    )
 
     train_dataset = PolypDataset(
         train_metadata_df,
-        images_dir=images_dir,
+        images_dir=train_images_dir,
         transform=train_transforms,
     )
     val_dataset = PolypDataset(
         val_metadata_df,
-        images_dir=images_dir,
+        images_dir=validation_images_dir,
         transform=val_transforms,
     )
     return train_dataset, val_dataset
@@ -366,12 +412,29 @@ def build_dataloaders(
         sampler=sampler,
         **dataloader_kwargs,
     )
-    val_loader = DataLoader(
+    val_loader = build_validation_dataloader(val_dataset, config, device)
+    return train_loader, val_loader
+
+
+def build_validation_dataloader(
+    val_dataset: PolypDataset,
+    config: TrainingConfig,
+    device: torch.device,
+) -> DataLoader:
+    """Create a deterministic validation dataloader."""
+    dataloader_kwargs = {
+        "batch_size": config.batch_size,
+        "num_workers": config.num_workers,
+        "pin_memory": device.type == "cuda",
+    }
+    if config.num_workers > 0:
+        dataloader_kwargs["persistent_workers"] = True
+
+    return DataLoader(
         val_dataset,
         shuffle=False,
         **dataloader_kwargs,
     )
-    return train_loader, val_loader
 
 
 # ---------------------------------------------------------------------------
@@ -607,28 +670,35 @@ def plot_and_save_metrics(
 
 
 def train(
-    csv_name: str | Path,
+    train_csv_name: str | Path,
+    validation_csv_name: str | Path,
     images_dir_name: str | Path,
     save_dir: str | Path,
     config: TrainingConfig | None = None,
+    validation_images_dir_name: str | Path | None = None,
 ) -> tuple[PolypClassifier, DataLoader]:
-    """Train the baseline classifier and return the best model plus val loader."""
+    """Train the classifier from explicit train and validation metadata CSVs."""
     config = config or TrainingConfig()
     set_random_seed(config.random_state)
 
-    metadata_path = DATA_DIR / Path(csv_name)
-    images_dir = DATA_DIR / Path(images_dir_name)
+    train_metadata_path = resolve_data_path(train_csv_name)
+    validation_metadata_path = resolve_data_path(validation_csv_name)
+    images_dir = resolve_data_path(images_dir_name)
+    validation_images_dir = (
+        resolve_data_path(validation_images_dir_name)
+        if validation_images_dir_name is not None
+        else images_dir
+    )
     experiment_dir = RESULTS_DIR / Path(save_dir)
     experiment_dir.mkdir(parents=True, exist_ok=True)
 
-    train_metadata_df, val_metadata_df = perform_clinical_data_split(
-        metadata_path,
-        train_ratio=config.train_ratio,
-        random_state=config.random_state,
-    )
+    train_metadata_df = load_metadata(train_metadata_path)
+    val_metadata_df = load_metadata(validation_metadata_path)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Hardware assigned for tensor computations: {device}")
+    print(f"Training metadata: {train_metadata_path}")
+    print(f"Validation metadata: {validation_metadata_path}")
 
     train_class_counts = get_class_counts(train_metadata_df)
     val_class_counts = get_class_counts(val_metadata_df)
@@ -642,6 +712,7 @@ def train(
         train_metadata_df,
         val_metadata_df,
         images_dir=images_dir,
+        val_images_dir=validation_images_dir,
         config=config,
     )
     train_loader, val_loader = build_dataloaders(

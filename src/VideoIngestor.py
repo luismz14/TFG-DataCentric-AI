@@ -34,6 +34,25 @@ PHASE2_OUTPUT_COLUMNS = [
     "bbox_area_ratio",
 ]
 
+PHASE2_BASE_METADATA_REQUIRED_COLUMNS = [
+    "patient_id",
+    "day",
+    "hour",
+    "R",
+    "F",
+    "histology",
+    "filename",
+]
+
+PHASE2_METADATA_REQUIRED_COLUMNS = [
+    *PHASE2_BASE_METADATA_REQUIRED_COLUMNS,
+    "video_filename",
+    "elapsed_seconds",
+]
+
+DEFAULT_PHASE2_SOURCE_METADATA_PATH = Path("data/phase1_train.csv")
+DEFAULT_DATASET_INVENTORY_PATH = Path("data/dataset_inventory.json")
+
 _PHASE2_COLUMN_DEFAULTS = {
     "filename": "",
     "histology": "",
@@ -138,6 +157,51 @@ def clean_histology_metadata_rows(
     return cleaned_df.reset_index(drop=True)
 
 
+def _load_phase2_metadata(metadata_csv_path: Path) -> pd.DataFrame:
+    metadata_df = read_csv(
+        metadata_csv_path,
+        dtype=str,
+        keep_default_na=False,
+    )
+
+    validate_required_columns(
+        metadata_df,
+        PHASE2_BASE_METADATA_REQUIRED_COLUMNS,
+        f"phase2 metadata '{metadata_csv_path}'",
+    )
+
+    if all(column in metadata_df.columns for column in PHASE2_METADATA_REQUIRED_COLUMNS):
+        return metadata_df
+
+    from utils.DataPhase2 import load_videos, match_videos_to_images
+
+    base_df = metadata_df.copy()
+    base_df["row_id"] = range(len(base_df))
+    base_df["image_timestamp"] = pd.to_datetime(
+        base_df["day"] + base_df["hour"],
+        format="%Y%m%d%H%M%S",
+    )
+
+    videos_df = load_videos(DEFAULT_DATASET_INVENTORY_PATH)
+    enriched_df = match_videos_to_images(
+        baseline_df=base_df,
+        videos_df=videos_df,
+    )
+
+    missing_video_mask = enriched_df["video_filename"].astype(str).str.strip().eq("")
+    if missing_video_mask.any():
+        raise ValueError("Some phase2 rows could not be matched to a source video.")
+
+    enriched_df["elapsed_seconds"] = (
+        enriched_df["image_timestamp"] - enriched_df["video_timestamp"]
+    ).dt.total_seconds().astype(int).astype(str)
+
+    return enriched_df.drop(
+        columns=["row_id", "image_timestamp", "video_timestamp"],
+        errors="ignore",
+    )
+
+
 def print_histology_candidate_summary(
     metadata_rows: pd.DataFrame | list[dict],
     candidates_per_histology: dict[str, int],
@@ -188,7 +252,7 @@ class VideoIngestor:
     def __init__(
         self,
         yolo_weights_path: str | Path,
-        output_dir: str | Path = "data/phase2/frames",
+        output_dir: str | Path = "data/phase2/framesv2",
         original_images_dir: str | Path = "data/unified_images",
         target_fps: int = 5,
         window_sec: int = 3,
@@ -766,19 +830,15 @@ class VideoIngestor:
 
 def augment_dataset(
     yolo_weights_path: str | Path,
-    metadata_csv_path: str | Path = "data/phase2/unified_data_phase2.csv",
-    output_dir: str | Path = "data/phase2/framesv2",
-    output_csv_path: str | Path = "data/phase2/data_phase2_v2.csv",
+    metadata_csv_path: str | Path = DEFAULT_PHASE2_SOURCE_METADATA_PATH,
+    output_dir: str | Path = "data/phase2/frames",
+    output_csv_path: str | Path = "data/phase2/phase2_train.csv",
     max_candidates_per_video: int = 10,
 ) -> dict[str, int | str]:
     metadata_csv_path = Path(metadata_csv_path)
     output_csv_path = Path(output_csv_path)
 
-    metadata_df = read_csv(
-        metadata_csv_path,
-        dtype=str,
-        keep_default_na=False,
-    )
+    metadata_df = _load_phase2_metadata(metadata_csv_path)
     metadata_df = clean_histology_metadata_rows(metadata_df, verbose=True)
 
     if metadata_df.empty:

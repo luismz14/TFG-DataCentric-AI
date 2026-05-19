@@ -24,18 +24,52 @@ CONF_MATRIX_NAME = 'confusion_matrix.png'
 LR_FIG_NAME = 'learning_rate_evolution.png'
 
 
-def plotTrainResults(phase_csv_dir, phase_img_dir, results_dir, train):
+def _load_model_weights(weights_path, device):
+    try:
+        return torch.load(weights_path, map_location=device, weights_only=True)
+    except TypeError:
+        return torch.load(weights_path, map_location=device)
+
+
+def _build_fixed_validation_loader(validation_csv_dir, validation_img_dir, config, device):
+    val_metadata_df = ModelTrain.load_metadata(validation_csv_dir)
+    _, val_transform = ModelTrain.build_transforms(config)
+    val_dataset = ModelTrain.PolypDataset(
+        val_metadata_df,
+        images_dir=ModelTrain.resolve_data_path(validation_img_dir),
+        transform=val_transform,
+    )
+    return ModelTrain.build_validation_dataloader(val_dataset, config, device)
+
+
+def plotTrainResults(
+    train_csv_dir,
+    validation_csv_dir,
+    train_img_dir,
+    validation_img_dir,
+    results_dir,
+    train,
+    force_train=False,
+):
     results_path = ModelTrain.RESULTS_DIR / Path(results_dir)
     best_model_weights_path = results_path / "best_baseline_model.pth"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    if not results_path.exists() or not best_model_weights_path.exists():
+    should_train = (
+        force_train
+        or not results_path.exists()
+        or not best_model_weights_path.exists()
+    )
+
+    if should_train:
         trained_model, validation_loader = ModelTrain.train(
-            phase_csv_dir,
-            phase_img_dir,
-            results_dir,
-            train,
+            train_csv_name=train_csv_dir,
+            validation_csv_name=validation_csv_dir,
+            images_dir_name=train_img_dir,
+            validation_images_dir_name=validation_img_dir,
+            save_dir=results_dir,
+            config=train,
         )
     else:
         print(f"Cargando modelo guardado desde: {best_model_weights_path}")
@@ -45,25 +79,12 @@ def plotTrainResults(phase_csv_dir, phase_img_dir, results_dir, train):
             stochastic_depth_prob=train.stochastic_depth_prob,
         ).to(device)
         trained_model.load_state_dict(
-            torch.load(best_model_weights_path, map_location=device)
+            _load_model_weights(best_model_weights_path, device)
         )
         trained_model.eval()
-
-        metadata_path = ModelTrain.DATA_DIR / phase_csv_dir
-        train_metadata_df, val_metadata_df = ModelTrain.perform_clinical_data_split(
-            metadata_path,
-            train_ratio=train.train_ratio
-        )
-        train_dataset, val_dataset = ModelTrain.build_datasets(
-            train_metadata_df,
-            val_metadata_df,
-            images_dir=ModelTrain.DATA_DIR / phase_img_dir,
-            config=train,
-        )
-        _, validation_loader = ModelTrain.build_dataloaders(
-            train_dataset,
-            val_dataset,
-            train_metadata_df=train_metadata_df,
+        validation_loader = _build_fixed_validation_loader(
+            validation_csv_dir=validation_csv_dir,
+            validation_img_dir=validation_img_dir,
             config=train,
             device=device,
         )
