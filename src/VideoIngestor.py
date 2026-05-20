@@ -252,7 +252,7 @@ class VideoIngestor:
     def __init__(
         self,
         yolo_weights_path: str | Path,
-        output_dir: str | Path = "data/phase2/framesv2",
+        output_dir: str | Path = "data/phase2/frames",
         original_images_dir: str | Path = "data/unified_images",
         target_fps: int = 5,
         window_sec: int = 3,

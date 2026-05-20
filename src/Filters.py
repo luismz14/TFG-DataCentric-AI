@@ -1,5 +1,5 @@
 """
-Image-quality filters used during phase 3.
+Image-quality metric and filtering helpers.
 """
 
 from __future__ import annotations

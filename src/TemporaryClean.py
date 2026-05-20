@@ -1,4 +1,5 @@
 from itertools import combinations
+import math
 from pathlib import Path
 
 import cv2
@@ -15,24 +16,16 @@ SSIM_THRESHOLD = 0.75
 PHASH_DISTANCE_THRESHOLD = 8
 
 # Maybe increase the confidece weight will improve the selection of good images (maybe 0.4 - 0.1 - 0.5) Test needed to confirm this.
-LAPLACIAN_WEIGHT = 0.50 
-BBOX_AREA_WEIGHT = 0.30
-DETECTION_CONFIDENCE_WEIGHT = 0.20
-
-
-# How can I select this values accurately? Random for first run
-TOP_K_BY_HISTOLOGY = {
-    "Adenoma": 1,
-    "Sessile_serrated_adenoma": 2,
-    "Hyperplastic": 2,
-    "Adenocarcinoma": 3,
-}
+LAPLACIAN_WEIGHT = 0.30 
+BBOX_AREA_WEIGHT = 0.20
+DETECTION_CONFIDENCE_WEIGHT = 0.50
 
 
 def phase4_handler(
     metadata_path: str | Path,
     images_dir: str | Path,
     output_path: str | Path | None = None,
+    top_k_by_histology: dict[str, int] | None = None,
 ) -> dict[str, object]:
     """
     Run the complete deduplication pipeline from a metadata table.
@@ -61,6 +54,9 @@ def phase4_handler(
     # 2. Validate required columns
     validate_required_columns(input_df, required_columns, "metadata")
 
+    if top_k_by_histology is None:
+        top_k_by_histology = calculate_top_k_by_histology(input_df)
+
     # 3. Group comparable images by clinical identity and time
     grouped_df = add_temporal_groups(
         dataframe=input_df,
@@ -87,6 +83,7 @@ def phase4_handler(
     # 7. Select top-K images per redundancy group
     selected_df = select_top_k_per_redundancy_group(
         dataframe=scored_df,
+        top_k_by_histology=top_k_by_histology,
     )
 
     # 8. Prepare final outputs
@@ -118,7 +115,28 @@ def phase4_handler(
         "final_df": final_df,
         "kept_df": kept_df,
         "summary": summary,
+        "top_k_by_histology": top_k_by_histology,
     }
+
+
+def deduplication_handler(
+    metadata_path: str | Path,
+    images_dir: str | Path,
+    output_path: str | Path | None = None,
+    top_k_by_histology: dict[str, int] | None = None,
+) -> dict[str, object]:
+    """
+    Run the visual deduplication pipeline from a metadata table.
+
+    This neutral name is used by the notebook phase numbering in the report.
+    """
+
+    return phase4_handler(
+        metadata_path=metadata_path,
+        images_dir=images_dir,
+        output_path=output_path,
+        top_k_by_histology=top_k_by_histology,
+    )
 
 
 def add_temporal_groups(
@@ -380,7 +398,7 @@ def calculate_similarity_pairs_for_group(
                 "phash_distance_threshold": phash_distance_threshold,
                 "redundant_by_ssim": redundant_by_ssim,
                 "redundant_by_phash": redundant_by_phash,
-                "is_redundant": redundant_by_ssim or redundant_by_phash,
+                "is_redundant": redundant_by_ssim and redundant_by_phash,
                 "redundancy_method": redundancy_method,
             }
         )
@@ -588,6 +606,41 @@ def summarize_redundancy_groups(dataframe: pd.DataFrame) -> pd.DataFrame:
     return summary_df
 
 
+def calculate_top_k_by_histology(
+    dataframe: pd.DataFrame,
+    histology_column: str = "histology",
+) -> dict[str, int]:
+    """
+    Calculate the top-K retained per histology by scaling each class count
+    against the largest class count.
+
+    The most frequent histology is mapped to 1. The rest use the ceiling of
+    max_count / class_count, which is equivalent to scaling proportions with
+    the largest proportion mapped to 1.
+    """
+
+    validate_required_columns(
+        dataframe,
+        [histology_column],
+        "top-K histology calculation",
+    )
+
+    histology_values = dataframe[histology_column].dropna().astype(str).str.strip()
+    histology_values = histology_values[histology_values != ""]
+
+    if histology_values.empty:
+        raise ValueError("Cannot calculate top_k without valid histology values.")
+
+    class_counts = histology_values.value_counts()
+    max_count = int(class_counts.max())
+
+    top_k_by_histology: dict[str, int] = {}
+    for histology, count in class_counts.items():
+        top_k_by_histology[str(histology)] = int(math.ceil(max_count / int(count)))
+
+    return top_k_by_histology
+
+
 def add_quality_scores(
     dataframe: pd.DataFrame,
     laplacian_weight: float = LAPLACIAN_WEIGHT,
@@ -674,7 +727,7 @@ def select_top_k_per_redundancy_group(
     validate_required_columns(dataframe, required_columns, "top-K selection")
 
     if top_k_by_histology is None:
-        top_k_by_histology = TOP_K_BY_HISTOLOGY
+        top_k_by_histology = calculate_top_k_by_histology(dataframe)
 
     for histology, top_k in top_k_by_histology.items():
         if top_k < 1:
