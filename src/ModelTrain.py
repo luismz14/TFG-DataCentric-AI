@@ -109,6 +109,7 @@ class BestCheckpoint:
     """Best model state seen during training."""
 
     macro_f1: float = -1.0
+    smoothed_macro_f1: float = -1.0
     epoch: int = 0
     val_loss: float = float("inf")
     confusion_matrix: np.ndarray | None = None
@@ -752,7 +753,11 @@ def train(
 
     best_checkpoint = BestCheckpoint()
     epochs_without_improvement = 0
+    smoothed_macro_f1: float | None = None
     best_model_weights_path = experiment_dir / "best_baseline_model.pth"
+    monitor_alpha = 0.30
+    f1_tie_tolerance = 0.002
+    loss_min_delta = 0.005
 
     print(f"Initiating training phase. Saving results to: {experiment_dir}")
     progress_bar = tqdm(range(config.num_epochs), desc="Training Progress", unit="epoch")
@@ -805,11 +810,33 @@ def train(
         history_val_loss.append(validation_result.loss)
         history_val_f1.append(validation_result.macro_f1)
 
-        scheduler.step(validation_result.macro_f1)
+        if smoothed_macro_f1 is None:
+            smoothed_macro_f1 = validation_result.macro_f1
+        else:
+            smoothed_macro_f1 = (
+                monitor_alpha * validation_result.macro_f1
+                + (1.0 - monitor_alpha) * smoothed_macro_f1
+            )
+
+        scheduler.step(smoothed_macro_f1)
+
+        improved_smoothed_f1 = (
+            smoothed_macro_f1 > best_checkpoint.smoothed_macro_f1 + 1e-4
+        )
+        similar_smoothed_f1 = (
+            smoothed_macro_f1 >= best_checkpoint.smoothed_macro_f1 - f1_tie_tolerance
+        )
+        improved_val_loss = (
+            validation_result.loss < best_checkpoint.val_loss - loss_min_delta
+        )
+        is_better_checkpoint = improved_smoothed_f1 or (
+            similar_smoothed_f1 and improved_val_loss
+        )
 
         checkpoint_status = ""
-        if validation_result.macro_f1 > best_checkpoint.macro_f1 + 1e-4:
+        if is_better_checkpoint:
             best_checkpoint.macro_f1 = validation_result.macro_f1
+            best_checkpoint.smoothed_macro_f1 = smoothed_macro_f1
             best_checkpoint.epoch = epoch + 1
             best_checkpoint.val_loss = validation_result.loss
             best_checkpoint.confusion_matrix = validation_result.confusion_matrix
@@ -828,6 +855,7 @@ def train(
                 "Train Loss": f"{epoch_train_loss:.4f}",
                 "Val Loss": f"{validation_result.loss:.4f}",
                 "Val F1": f"{validation_result.macro_f1:.4f}{checkpoint_status}",
+                "Smooth F1": f"{smoothed_macro_f1:.4f}",
                 "LR": format_learning_rates(optimizer),
             }
         )
@@ -839,7 +867,8 @@ def train(
             print()
             print(
                 "Early stopping triggered after "
-                f"{config.early_stopping_patience} epochs without improving macro-F1."
+                f"{config.early_stopping_patience} epochs without improving "
+                "smoothed macro-F1 or validation loss."
             )
             break
 
@@ -852,7 +881,8 @@ def train(
     print()
     print(
         "Optimization sequence completed. "
-        f"Best validation macro-F1: {best_checkpoint.macro_f1:.4f} "
+        f"Selected checkpoint macro-F1: {best_checkpoint.macro_f1:.4f} "
+        f"(smoothed: {best_checkpoint.smoothed_macro_f1:.4f}) "
         f"at epoch {best_checkpoint.epoch}."
     )
 

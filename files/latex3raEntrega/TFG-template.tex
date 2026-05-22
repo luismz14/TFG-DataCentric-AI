@@ -303,36 +303,38 @@ La primera métrica es la media del canal V en el espacio HSV, utilizada como es
 \subsubsection{Aplicación secuencial de filtros}
 El filtrado se aplica de forma secuencial. Si una imagen no supera uno de los criterios, queda descartada y no pasa a los filtros posteriores. Este diseño evita aplicar cálculos o decisiones posteriores sobre imágenes que ya han sido consideradas no aptas, y permite interpretar cuántas imágenes elimina cada criterio dentro del orden definido.
 
-En la configuración actual se utilizan tres filtros:
+En la configuración actual se utilizan tres filtros. En todos los casos, los umbrales se seleccionan a partir de la distribución empírica de la métrica y de la inspección visual de ejemplos cercanos al punto de corte. Esta comparación permite equilibrar dos riesgos opuestos: conservar imágenes sin valor diagnóstico o eliminar frames que todavía contienen información útil.
 
-\begin{itemize}
-    \item \textbf{Oscuridad:} detecta imágenes con iluminación insuficiente. La imagen se transforma al espacio HSV y se calcula la media del canal V. Si este valor es inferior a $T_{oscuro}=60$, el frame se descarta.
-    \item \textbf{Uniformidad:} elimina imágenes con muy poca estructura visual, típicamente producidas por contacto de la cámara con la mucosa. Para ello se calcula la entropía de Shannon en escala de grises. Si la entropía es inferior a $T_{uniform}=6.3$, el frame se descarta.
-    \item \textbf{Desenfoque:} detecta imágenes borrosas mediante la varianza del Laplaciano. Si la varianza es inferior a $T_{lap}=25$, la imagen se considera insuficientemente nítida y se elimina.
-\end{itemize}
-
-\subsubsection{Selección de umbrales}
-Los umbrales se seleccionan a partir de la distribución empírica de cada métrica y de la inspección visual de ejemplos cercanos a distintos puntos de corte. Para cada filtro se comparan varios valores candidatos alrededor del umbral final: 55, 60 y 65 para oscuridad; 6.0, 6.3 y 6.5 para uniformidad; y 25, 30 y 35 para desenfoque. Esta comparación permite equilibrar dos riesgos opuestos: conservar imágenes sin valor diagnóstico o eliminar frames que todavía contienen información útil.
-
-La Figura~\ref{fig:phase4_threshold_histograms} muestra la distribución de las tres métricas y los umbrales candidatos evaluados. Los umbrales seleccionados se sitúan en zonas de transición de la distribución, evitando cortes excesivamente agresivos sobre la masa principal de imágenes.
+\textbf{Filtro de oscuridad.} Detecta imágenes con iluminación insuficiente. La imagen se transforma al espacio HSV y se calcula la media del canal V. Si este valor es inferior a $T_{oscuro}=55$, el frame se descarta. Para fijar el umbral se comparan los valores candidatos 50, 55 y 60, como se muestra en la Figura~\ref{fig:phase4_darkness_threshold}.
 
 \begin{center}
 \begin{minipage}{\linewidth}
 \centering
-\includegraphics[width=\linewidth]{img/phase4_threshold_histograms.png}
-\captionof{figure}{Distribución de las métricas utilizadas en el filtrado de calidad. La línea de mayor grosor marca el umbral seleccionado para cada filtro.}
-\label{fig:phase4_threshold_histograms}
+\includegraphics[width=\linewidth]{img/phase4_darkness_threshold_examples.png}
+\captionof{figure}{Ejemplos cercanos a los umbrales candidatos del filtro de oscuridad.}
+\label{fig:phase4_darkness_threshold}
 \end{minipage}
 \end{center}
 
-Además de la distribución numérica, se revisan ejemplos cercanos al umbral seleccionado para comprobar que la decisión tenga sentido visual. La Figura~\ref{fig:phase4_threshold_examples} muestra imágenes próximas a los tres puntos de corte utilizados, lo que permite validar que los umbrales separan casos de baja calidad sin convertir el filtrado en una eliminación excesivamente restrictiva.
+\textbf{Filtro de uniformidad.} Elimina imágenes con muy poca estructura visual, típicamente producidas por contacto de la cámara con la mucosa. Para ello se calcula la entropía de Shannon en escala de grises. Si la entropía es inferior a $T_{uniform}=6.25$, el frame se descarta. Los valores candidatos evaluados son 6.0, 6.25 y 6.5, resumidos visualmente en la Figura~\ref{fig:phase4_uniformity_threshold}.
 
 \begin{center}
 \begin{minipage}{\linewidth}
 \centering
-\includegraphics[width=\linewidth]{img/phase4_threshold_examples.png}
-\captionof{figure}{Ejemplos de frames cercanos a los umbrales seleccionados para oscuridad, uniformidad y desenfoque.}
-\label{fig:phase4_threshold_examples}
+\includegraphics[width=\linewidth]{img/phase4_uniformity_threshold_examples.png}
+\captionof{figure}{Ejemplos cercanos a los umbrales candidatos del filtro de uniformidad.}
+\label{fig:phase4_uniformity_threshold}
+\end{minipage}
+\end{center}
+
+\textbf{Filtro de desenfoque.} Detecta imágenes borrosas mediante la varianza del Laplaciano. Si la varianza es inferior a $T_{lap}=25$, la imagen se considera insuficientemente nítida y se elimina. En este caso se comparan los valores candidatos 20, 25 y 30, tal como se muestra en la Figura~\ref{fig:phase4_blur_threshold}.
+
+\begin{center}
+\begin{minipage}{\linewidth}
+\centering
+\includegraphics[width=\linewidth]{img/phase4_blur_threshold_examples.png}
+\captionof{figure}{Ejemplos cercanos a los umbrales candidatos del filtro de desenfoque.}
+\label{fig:phase4_blur_threshold}
 \end{minipage}
 \end{center}
 
@@ -344,6 +346,8 @@ El resultado de esta fase es un nuevo CSV de entrenamiento que conserva la misma
 Para evaluar el efecto de las fases del pipeline, el modelo \textit{baseline} se mantiene fijo y se modifica únicamente el conjunto de entrenamiento. La validación se realiza siempre sobre el mismo conjunto, definido en la fase 1, para que las comparaciones entre fases no dependan de cambios en la partición de evaluación.
 
 La métrica principal es el F1-score macro, ya que otorga el mismo peso a todas las clases y resulta más informativa que la accuracy en un problema multiclase desbalanceado. De forma complementaria se reportan accuracy, balanced accuracy, weighted F1 y métricas por clase.
+
+Es importante destacar que el baseline inicial se ha ejecutado con varias semillas para estimar la estabilidad del entrenamiento, mientras que los resultados de las fases posteriores corresponden por el momento a ejecuciones preliminares. En la versión final del trabajo se preve repetir los experimentos principales con el mismo protocolo de semillas, de modo que la comparacion entre fases no dependa de una unica ejecucion.
 
 \subsection{Resultados de la fase 1: baseline}
 El conjunto efectivo utilizado en la fase 1 contiene 3252 imágenes con etiqueta histológica válida. La Tabla~\ref{tab:phase1_split} muestra la distribución obtenida tras la partición estratificada y agrupada.
@@ -453,6 +457,14 @@ Como la versión actual solo considera redundantes los pares que cumplen ambos u
 La distribución final tras esta fase queda menos redundante, pero sigue conservando una presencia elevada de las clases minoritarias: 2660 adenomas, 2330 adenomas sésiles serrados, 1510 hiperplásicos y 701 adenocarcinomas. El entrenamiento sobre el dataset deduplicado obtiene un F1-score macro de 0.5349 en validación, con accuracy 0.5502, balanced accuracy 0.5764 y weighted F1 0.5596.
 
 Aunque la deduplicación reduce el F1-score macro respecto a la fase 2, su función principal no es aumentar el volumen de datos, sino controlar la redundancia temporal introducida por la ingestión desde vídeo. Al exigir que se cumplan simultáneamente los umbrales de SSIM y pHash, la fase se mantiene conservadora y evita eliminar variantes visuales que podrían seguir aportando información útil.
+
+\subsection{Conclusiones provisionales}
+
+Los resultados obtenidos hasta esta entrega apoyan parcialmente la hipotesis principal del trabajo: modificar sistematicamente el conjunto de entrenamiento puede mejorar el rendimiento de un modelo baseline fijo sin recurrir a arquitecturas más complejas. La fase de ingestión desde video produce la mejora más clara hasta el momento, aumentando el F1-score macro respecto al baseline inicial. Esto sugiere que los frames extraidos alrededor de las anotaciones clinicas aportan variabilidad visual util para el entrenamiento.
+
+La fase de deduplicación reduce parte de la redundancia temporal introducida durante la ingestion. Aunque el F1-score macro disminuye respecto a la fase anterior, el resultado sigue siendo superior al baseline inicial. Esta fase debe interpretarse como un mecanismo de control de redundancia y no unicamente como una tecnica orientada a maximizar la metrica de forma inmediata.
+
+La fase de filtrado de calidad queda como el principal bloque pendiente. Su ejecución permitirá comprobar si la eliminacion de imagenes con baja iluminacion, baja textura o desenfoque mejora la robustez del conjunto curado. Como trabajo inmediato, tambien queda pendiente revisar la estabilidad de los resultados mediante nuevas ejecuciones y analizar si la receta de entrenamiento actual requiere pequeños ajustes sin alterar el enfoque Data-Centric del proyecto.
 
 \section{Uso de IA}
 Durante el desarrollo de este proyecto se han utilizado como apoyo en dos tipos de tareas. En primer lugar, se ha utilizado para la revisión formal del texto, incluyendo aspectos de corrección lingüística y reformulación de párrafos ya redactados. En segundo lugar, se han utilizado como apoyo para comprender conceptos técnicos de visión por computador y deep learning no estudiados previamente.

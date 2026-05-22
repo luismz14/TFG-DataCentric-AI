@@ -16,7 +16,7 @@ BASELINE_CONFIG = ModelTrain.TrainingConfig(
     val_resize_size=256,
     batch_size=32,
     num_workers=0,
-    num_epochs=100,
+    num_epochs=200,
 
     warmup_epochs=3,
     head_lr=1e-3, 

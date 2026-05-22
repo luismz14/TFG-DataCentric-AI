@@ -15,7 +15,6 @@ TEMPORAL_TOLERANCE_SECONDS = 2.0
 SSIM_THRESHOLD = 0.75
 PHASH_DISTANCE_THRESHOLD = 8
 
-# Maybe increase the confidece weight will improve the selection of good images (maybe 0.4 - 0.1 - 0.5) Test needed to confirm this.
 LAPLACIAN_WEIGHT = 0.30 
 BBOX_AREA_WEIGHT = 0.20
 DETECTION_CONFIDENCE_WEIGHT = 0.50
