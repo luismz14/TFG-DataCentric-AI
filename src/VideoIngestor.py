@@ -3,12 +3,16 @@ import sys
 
 sys.path.append("..")
 
+import hashlib
+import json
 import uuid
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
 import pandas as pd
+from tqdm import tqdm
 
 from utils.common import read_csv, validate_required_columns, write_csv
 
@@ -33,6 +37,27 @@ PHASE2_OUTPUT_COLUMNS = [
     "detection_confidence",
     "bbox_area_ratio",
 ]
+
+_PROGRESS_HISTOLOGY_LABELS = {
+    "Adenoma": "Adenoma",
+    "Sessile_serrated_adenoma": "SSA",
+    "Hyperplastic": "Hyperplastic",
+    "Adenocarcinoma": "Adenocarcinoma",
+}
+
+PHASE2_STATE_VERSION = 1
+
+# The phase2 JSON intentionally stays small:
+# source_signature + per-video status + class counters for tqdm.
+VIDEO_STATE_PENDING = "pending"
+VIDEO_STATE_RUNNING = "running"
+VIDEO_STATE_DONE = "done"
+VIDEO_STATE_FAILED = "failed"
+VIDEO_RESTARTABLE_STATES = {
+    VIDEO_STATE_PENDING,
+    VIDEO_STATE_RUNNING,
+    VIDEO_STATE_FAILED,
+}
 
 PHASE2_BASE_METADATA_REQUIRED_COLUMNS = [
     "patient_id",
@@ -225,6 +250,341 @@ def print_histology_candidate_summary(
     return summary_df
 
 
+def _count_added_rows_by_histology(output_df: pd.DataFrame) -> Counter[str]:
+    if "source_type" not in output_df.columns or "histology" not in output_df.columns:
+        return Counter()
+
+    added_mask = output_df["source_type"].astype(str).eq("video_candidate")
+    return Counter(output_df.loc[added_mask, "histology"].astype(str))
+
+
+def _format_augmentation_progress(
+    added_counts: Counter[str],
+    *,
+    pending_videos: int,
+    failed_videos: int,
+) -> str:
+    class_counts = " ".join(
+        f"{_PROGRESS_HISTOLOGY_LABELS[histology]}:{added_counts.get(histology, 0)}"
+        for histology in HISTOLOGY_ORDER
+    )
+    return (
+        f"pendientes={pending_videos} "
+        f"fallidos={failed_videos} "
+        f"anadidas[{class_counts}]"
+    )
+
+
+def _empty_histology_counts() -> dict[str, int]:
+    return {histology: 0 for histology in HISTOLOGY_ORDER}
+
+
+def _phase2_state_path(output_csv_path: Path) -> Path:
+    return output_csv_path.with_suffix(".json")
+
+
+def _phase2_video_key(patient_id: str, video_filename: str) -> str:
+    return f"{patient_id}::{video_filename}"
+
+
+def _build_phase2_source_signature(
+    sorted_df: pd.DataFrame,
+    *,
+    yolo_weights_path: str | Path,
+    output_dir: str | Path,
+    max_candidates_per_video: int,
+    target_fps: int,
+    window_sec: int,
+) -> str:
+    """Hash the input rows and relevant config so stale state is not reused."""
+    signature_columns = [
+        column
+        for column in PHASE2_METADATA_REQUIRED_COLUMNS
+        if column in sorted_df.columns
+    ]
+    signature_df = sorted_df.loc[:, signature_columns].astype(str)
+    payload = {
+        "config": {
+            "max_candidates_per_video": int(max_candidates_per_video),
+            "output_dir": str(Path(output_dir)),
+            "target_fps": int(target_fps),
+            "window_sec": int(window_sec),
+            "yolo_weights_path": str(Path(yolo_weights_path)),
+        },
+        "rows": json.loads(
+            signature_df.to_json(
+                orient="records",
+                force_ascii=True,
+            )
+        ),
+    }
+    encoded_payload = json.dumps(
+        payload,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded_payload).hexdigest()
+
+
+def _build_phase2_video_states(grouped_items: list[tuple]) -> dict[str, str]:
+    videos: dict[str, str] = {}
+    for (patient_id, video_filename), _ in grouped_items:
+        videos[_phase2_video_key(str(patient_id), str(video_filename))] = (
+            VIDEO_STATE_PENDING
+        )
+    return videos
+
+
+def _save_phase2_state(state: dict, state_path: Path) -> None:
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+
+    temp_path = state_path.with_name(f"{state_path.name}.tmp")
+    temp_path.write_text(
+        json.dumps(
+            state,
+            ensure_ascii=True,
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    temp_path.replace(state_path)
+
+
+def _load_phase2_state(state_path: Path) -> dict | None:
+    if not state_path.exists():
+        return None
+
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    return state if isinstance(state, dict) else None
+
+
+def _initialize_phase2_state(
+    *,
+    source_signature: str,
+    video_states: dict[str, str],
+) -> dict:
+    return {
+        "version": PHASE2_STATE_VERSION,
+        "source_signature": source_signature,
+        "counts_by_histology": _empty_histology_counts(),
+        "videos": video_states,
+    }
+
+
+def _load_or_initialize_phase2_state(
+    *,
+    state_path: Path,
+    source_signature: str,
+    video_states: dict[str, str],
+) -> tuple[dict, bool, bool]:
+    state = _load_phase2_state(state_path)
+    expected_video_keys = set(video_states)
+    state_video_keys = set(state.get("videos", {})) if state else set()
+
+    if (
+        state is None
+        or state.get("version") != PHASE2_STATE_VERSION
+        or state.get("source_signature") != source_signature
+        or state_video_keys != expected_video_keys
+    ):
+        return (
+            _initialize_phase2_state(
+                source_signature=source_signature,
+                video_states=video_states,
+            ),
+            True,
+            True,
+        )
+
+    changed = False
+    for video_key, status in list(state["videos"].items()):
+        if status == VIDEO_STATE_RUNNING:
+            state["videos"][video_key] = VIDEO_STATE_PENDING
+            changed = True
+        elif status not in {
+            VIDEO_STATE_PENDING,
+            VIDEO_STATE_DONE,
+            VIDEO_STATE_FAILED,
+        }:
+            state["videos"][video_key] = VIDEO_STATE_PENDING
+            changed = True
+
+    state["counts_by_histology"] = {
+        **_empty_histology_counts(),
+        **{
+            histology: int(count)
+            for histology, count in state.get("counts_by_histology", {}).items()
+            if histology in HISTOLOGY_ORDER
+        },
+    }
+    return state, False, changed
+
+
+def _phase2_state_added_counts(state: dict) -> Counter[str]:
+    return Counter(state.get("counts_by_histology", {}))
+
+
+def _phase2_state_pending_count(state: dict) -> int:
+    return sum(
+        1
+        for status in state.get("videos", {}).values()
+        if status in {VIDEO_STATE_PENDING, VIDEO_STATE_RUNNING}
+    )
+
+
+def _phase2_state_failed_count(state: dict) -> int:
+    return sum(
+        1 for status in state.get("videos", {}).values() if status == VIDEO_STATE_FAILED
+    )
+
+
+def _phase2_state_done_count(state: dict) -> int:
+    return sum(
+        1 for status in state.get("videos", {}).values() if status == VIDEO_STATE_DONE
+    )
+
+
+def _phase2_output_video_mask(
+    output_df: pd.DataFrame,
+    *,
+    patient_id: str,
+    video_filename: str,
+) -> pd.Series:
+    if "patient_id" not in output_df.columns or "video_filename" not in output_df.columns:
+        return pd.Series(False, index=output_df.index)
+
+    return output_df["patient_id"].astype(str).eq(str(patient_id)) & output_df[
+        "video_filename"
+    ].astype(str).eq(str(video_filename))
+
+
+def _phase2_baseline_output_df(sorted_df: pd.DataFrame) -> pd.DataFrame:
+    output_df = sorted_df.reset_index(drop=True).copy()
+    output_df["source_type"] = "original"
+    output_df["detection_confidence"] = 0.0
+    output_df["bbox_area_ratio"] = 0.0
+    return _finalize_phase2_output_columns(output_df)
+
+
+def _initialize_phase2_output_csv(sorted_df: pd.DataFrame, output_csv_path: Path) -> None:
+    write_csv(_phase2_baseline_output_df(sorted_df), output_csv_path)
+
+
+def _read_phase2_output_or_baseline(
+    output_csv_path: Path,
+    sorted_df: pd.DataFrame,
+) -> pd.DataFrame:
+    if output_csv_path.exists():
+        try:
+            return _finalize_phase2_output_columns(
+                read_csv(
+                    output_csv_path,
+                    dtype=str,
+                    keep_default_na=False,
+                )
+            )
+        except Exception:
+            pass
+
+    return _phase2_baseline_output_df(sorted_df)
+
+
+def _upsert_phase2_video_output(
+    *,
+    output_csv_path: Path,
+    sorted_df: pd.DataFrame,
+    patient_id: str,
+    video_filename: str,
+    video_output_df: pd.DataFrame,
+) -> None:
+    output_df = _read_phase2_output_or_baseline(output_csv_path, sorted_df)
+    video_output_df = _finalize_phase2_output_columns(video_output_df)
+    video_mask = _phase2_output_video_mask(
+        output_df,
+        patient_id=patient_id,
+        video_filename=video_filename,
+    )
+    merged_df = _finalize_phase2_output_columns(
+        pd.concat(
+            [output_df.loc[~video_mask], video_output_df],
+            ignore_index=True,
+        )
+    )
+    write_csv(merged_df, output_csv_path)
+
+
+def _sync_phase2_state_from_output_csv(
+    state: dict,
+    output_csv_path: Path,
+    grouped_items: list[tuple],
+) -> bool:
+    """Use the CSV as source of truth for counters and completed-video validity."""
+    changed = False
+    if not output_csv_path.exists():
+        for video_key, status in list(state.get("videos", {}).items()):
+            if status == VIDEO_STATE_DONE:
+                state["videos"][video_key] = VIDEO_STATE_PENDING
+                changed = True
+        state["counts_by_histology"] = _empty_histology_counts()
+        return changed
+
+    try:
+        output_df = _finalize_phase2_output_columns(
+            read_csv(
+                output_csv_path,
+                dtype=str,
+                keep_default_na=False,
+            )
+        )
+    except Exception:
+        for video_key, status in list(state.get("videos", {}).items()):
+            if status == VIDEO_STATE_DONE:
+                state["videos"][video_key] = VIDEO_STATE_PENDING
+                changed = True
+        state["counts_by_histology"] = _empty_histology_counts()
+        return changed
+
+    added_counts: Counter[str] = Counter()
+    for (patient_id, video_filename), _ in grouped_items:
+        video_key = _phase2_video_key(str(patient_id), str(video_filename))
+        if state["videos"].get(video_key) != VIDEO_STATE_DONE:
+            continue
+
+        video_mask = _phase2_output_video_mask(
+            output_df,
+            patient_id=str(patient_id),
+            video_filename=str(video_filename),
+        )
+        if not video_mask.any():
+            state["videos"][video_key] = VIDEO_STATE_PENDING
+            changed = True
+            continue
+
+        added_counts.update(_count_added_rows_by_histology(output_df.loc[video_mask]))
+
+    normalized_added_counts = _empty_histology_counts()
+    for histology in HISTOLOGY_ORDER:
+        normalized_added_counts[histology] = int(added_counts.get(histology, 0))
+
+    if state.get("counts_by_histology") != normalized_added_counts:
+        state["counts_by_histology"] = normalized_added_counts
+        changed = True
+
+    return changed
+
+
+def _phase2_state_is_complete(state: dict, output_csv_path: Path) -> bool:
+    return output_csv_path.exists() and all(
+        status == VIDEO_STATE_DONE for status in state.get("videos", {}).values()
+    )
+
+
 def detect_clinical_area(
     frame,
     threshold: int = 15,
@@ -325,9 +685,18 @@ class VideoIngestor:
         # Reset YOLO internal predictor state so tracks do not leak across timestamps.
         self.detector.predictor = None
 
-        for frame_idx in sampled_indices:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-            ret, frame = cap.read()
+        sampled_index_set = set(sampled_indices)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+
+        for frame_idx in range(start_frame, end_frame + 1):
+            ret = cap.grab()
+            if not ret:
+                break
+
+            if frame_idx not in sampled_index_set:
+                continue
+
+            ret, frame = cap.retrieve()
             if not ret:
                 continue
 
@@ -475,7 +844,7 @@ class VideoIngestor:
         ]
         validate_required_columns(metadata_df, required_columns, "metadata_rows")
 
-        metadata_df = clean_histology_metadata_rows(metadata_df, verbose=True)
+        metadata_df = clean_histology_metadata_rows(metadata_df, verbose=False)
         if metadata_df.empty:
             return _finalize_phase2_output_columns(metadata_df)
 
@@ -507,10 +876,9 @@ class VideoIngestor:
 
         output_df = _finalize_phase2_output_columns(output_df)
 
-        total_rows = len(metadata_df)
         new_rows: list[dict] = []
 
-        for row_index, row in enumerate(metadata_df.to_dict(orient="records"), start=1):
+        for row in metadata_df.to_dict(orient="records"):
             base_row = {
                 "histology": row["histology"],
                 "patient_id": row["patient_id"],
@@ -543,16 +911,6 @@ class VideoIngestor:
                     }
                 )
 
-            self._print_progress(
-                patient_id=record.patient_id,
-                current_row=row_index,
-                total_rows=total_rows,
-                generated_rows=len(new_rows),
-            )
-
-        if total_rows > 0:
-            print()
-
         if not new_rows:
             return output_df
 
@@ -570,23 +928,14 @@ class VideoIngestor:
             metadata_df["histology"]
             .value_counts()
             .reindex(HISTOLOGY_ORDER, fill_value=0)
-            .replace(0, 1)
         )
-
-        if self.base_histology not in class_counts.index:
-            raise ValueError(f"Unknown base_histology: {self.base_histology}")
-
-        # Inverse-frequency weights give minority classes more frame candidates.
-        # The exponent softens the compensation strength.
-        weights = (
-            len(metadata_df) / (len(class_counts) * class_counts)
-        ) ** self.candidate_exponent
-        base_weight = weights[self.base_histology]
+        class_frequencies = class_counts / class_counts.sum()
+        majority_frequency = class_frequencies.max()
 
         candidates_per_histology: dict[str, int] = {}
         for histology in HISTOLOGY_ORDER:
-            ratio = weights[histology] / base_weight
-            candidates = math.ceil(self.base_candidates * ratio)
+            frequency = class_frequencies[histology]
+            candidates = 1 if frequency == 0 else math.ceil(majority_frequency / frequency)
             # The maximum avoids too many redundant frames from the same video.
             candidates = max(1, min(self.max_candidates_per_video, candidates))
             candidates_per_histology[histology] = candidates
@@ -815,28 +1164,18 @@ class VideoIngestor:
 
         return detection_metadata
 
-    def _print_progress(
-        self,
-        patient_id: str,
-        current_row: int,
-        total_rows: int,
-        generated_rows: int,
-    ) -> None:
-        print(
-            f"\r{patient_id} data increased {current_row}/{total_rows} | generated {generated_rows}",
-            end="",
-            flush=True,
-        )
-
 def augment_dataset(
     yolo_weights_path: str | Path,
     metadata_csv_path: str | Path = DEFAULT_PHASE2_SOURCE_METADATA_PATH,
-    output_dir: str | Path = "data/phase2/frames",
-    output_csv_path: str | Path = "data/phase2/phase2_train.csv",
-    max_candidates_per_video: int = 10,
-) -> dict[str, int | str]:
+    output_dir: str | Path = "data/phase2/framesv2",
+    output_csv_path: str | Path = "data/phase2/phase2_trainv2.csv",
+    max_candidates_per_video: int = 100,
+    target_fps: int = 5,
+    window_sec: int = 3,
+) -> dict[str, int | str | bool]:
     metadata_csv_path = Path(metadata_csv_path)
     output_csv_path = Path(output_csv_path)
+    state_path = _phase2_state_path(output_csv_path)
 
     metadata_df = _load_phase2_metadata(metadata_csv_path)
     metadata_df = clean_histology_metadata_rows(metadata_df, verbose=True)
@@ -844,21 +1183,95 @@ def augment_dataset(
     if metadata_df.empty:
         output_df = _finalize_phase2_output_columns(metadata_df)
         write_csv(output_df, output_csv_path)
+        state = _initialize_phase2_state(
+            source_signature=_build_phase2_source_signature(
+                metadata_df,
+                yolo_weights_path=yolo_weights_path,
+                output_dir=output_dir,
+                max_candidates_per_video=max_candidates_per_video,
+                target_fps=target_fps,
+                window_sec=window_sec,
+            ),
+            video_states={},
+        )
+        _save_phase2_state(state, state_path)
         return {
             "videos_processed_first_pass": 0,
             "videos_recovered_second_pass": 0,
             "videos_still_failed": 0,
+            "videos_done": 0,
+            "videos_pending": 0,
+            "ingestion_complete": True,
             "rows_output": 0,
             "output_csv_path": str(output_csv_path),
+            "state_json_path": str(state_path),
         }
 
     sorted_df = metadata_df.sort_values(
         ["patient_id", "video_filename", "elapsed_seconds", "filename"]
     ).reset_index(drop=True)
 
+    # One resumable unit is one source video. Each group can contain several
+    # annotated timestamps from the same patient/video pair.
+    grouped_items = list(sorted_df.groupby(["patient_id", "video_filename"], sort=False))
+    total_videos = len(grouped_items)
+    video_states = _build_phase2_video_states(grouped_items)
+    source_signature = _build_phase2_source_signature(
+        sorted_df,
+        yolo_weights_path=yolo_weights_path,
+        output_dir=output_dir,
+        max_candidates_per_video=max_candidates_per_video,
+        target_fps=target_fps,
+        window_sec=window_sec,
+    )
+    state, state_is_new, state_changed = _load_or_initialize_phase2_state(
+        state_path=state_path,
+        source_signature=source_signature,
+        video_states=video_states,
+    )
+
+    if state_is_new:
+        # A new state means a new ingestion run. Start the CSV from originals only.
+        _initialize_phase2_output_csv(sorted_df, output_csv_path)
+    elif not output_csv_path.exists():
+        # If the JSON survived but the CSV did not, completed videos cannot be trusted.
+        _initialize_phase2_output_csv(sorted_df, output_csv_path)
+
+    # The JSON is only a lightweight index. Recompute counters from the CSV so
+    # interrupted runs and manual edits do not leave tqdm with stale numbers.
+    state_repaired = _sync_phase2_state_from_output_csv(
+        state,
+        output_csv_path,
+        grouped_items,
+    )
+    if state_is_new or state_changed or state_repaired:
+        _save_phase2_state(state, state_path)
+
+    output_df = _read_phase2_output_or_baseline(output_csv_path, sorted_df)
+    if _phase2_state_is_complete(state, output_csv_path):
+        return {
+            "videos_processed_first_pass": 0,
+            "videos_recovered_second_pass": 0,
+            "videos_still_failed": 0,
+            "videos_done": _phase2_state_done_count(state),
+            "videos_pending": 0,
+            "ingestion_complete": True,
+            "rows_output": len(output_df),
+            "output_csv_path": str(output_csv_path),
+            "state_json_path": str(state_path),
+        }
+
+    work_items = []
+    for (patient_id, video_filename), video_rows_df in grouped_items:
+        video_key = _phase2_video_key(str(patient_id), str(video_filename))
+        if state["videos"][video_key] in VIDEO_RESTARTABLE_STATES:
+            work_items.append((video_key, str(patient_id), str(video_filename), video_rows_df))
+
     ingestor = VideoIngestor(
         yolo_weights_path=yolo_weights_path,
         output_dir=output_dir,
+        target_fps=target_fps,
+        window_sec=window_sec,
         max_candidates_per_video=max_candidates_per_video,
     )
     ingestor.candidates_per_histology = ingestor._build_candidates_per_histology(sorted_df)
@@ -873,106 +1286,146 @@ def augment_dataset(
                 "Install them in this environment with: %pip install dropbox python-dotenv"
             ) from error
         raise
-    
-    grouped = sorted_df.groupby(["patient_id", "video_filename"], sort=False)
-    total_videos = grouped.ngroups
 
-    augmented_groups = []
     failed_groups = []
+    videos_processed_first_pass = 0
+    videos_recovered_second_pass = 0
 
-    for video_index, ((patient_id, video_filename), video_rows_df) in enumerate(grouped, start=1):
-        print(f"\n[{video_index}/{total_videos}] Processing {patient_id} | {video_filename}")
-
-        local_video_path = download_video_to_temp(patient_id=patient_id, video_name=video_filename)
-        if local_video_path is None:
-            print("Skipping video because download failed.")
-            failed_groups.append(
-                {
-                    "patient_id": patient_id,
-                    "video_filename": video_filename,
-                    "video_rows_df": video_rows_df,
-                    "local_video_path": None,
-                }
+    def refresh_progress(progress_bar) -> None:
+        progress_bar.set_postfix_str(
+            _format_augmentation_progress(
+                _phase2_state_added_counts(state),
+                pending_videos=_phase2_state_pending_count(state),
+                failed_videos=_phase2_state_failed_count(state),
             )
-            continue
+        )
+
+    def process_video_group(
+        *,
+        video_key: str,
+        patient_id: str,
+        video_filename: str,
+        video_rows_df: pd.DataFrame,
+        local_video_path: str | None = None,
+    ) -> tuple[bool, str | None]:
+        # Mark before downloading/processing so a crash is visible on resume.
+        state["videos"][video_key] = VIDEO_STATE_RUNNING
+        _save_phase2_state(state, state_path)
 
         try:
+            if local_video_path is None:
+                local_video_path = download_video_to_temp(
+                    patient_id=patient_id,
+                    video_name=video_filename,
+                    verbose=False,
+                )
+
+            if local_video_path is None:
+                raise RuntimeError("download failed")
+
             augmented_video_df = ingestor.augment_video_rows(
                 video_path=local_video_path,
                 metadata_rows=video_rows_df,
             )
-            augmented_groups.append(augmented_video_df)
-            delete_temp_video(local_video_path)
-        except Exception as error:
-            print(f"\nError at {patient_id} | {video_filename}: {error}")
-            failed_groups.append(
-                {
-                    "patient_id": patient_id,
-                    "video_filename": video_filename,
-                    "video_rows_df": video_rows_df,
-                    "local_video_path": local_video_path,
-                }
+            # Upsert avoids duplicate rows if this video was partially processed
+            # or is retried after a failure.
+            _upsert_phase2_video_output(
+                output_csv_path=output_csv_path,
+                sorted_df=sorted_df,
+                patient_id=patient_id,
+                video_filename=video_filename,
+                video_output_df=augmented_video_df,
             )
 
-    recovered_groups = []
-    still_failed_groups = []
+            state["videos"][video_key] = VIDEO_STATE_DONE
+            # Recalculate counters from CSV instead of incrementing in memory;
+            # the CSV is the durable record of generated rows.
+            _sync_phase2_state_from_output_csv(
+                state,
+                output_csv_path,
+                grouped_items,
+            )
+            _save_phase2_state(state, state_path)
+            delete_temp_video(local_video_path, verbose=False)
+            return True, None
 
-    if failed_groups:
-        print(f"\nRetrying {len(failed_groups)} failed videos after first pass...")
+        except Exception:
+            state["videos"][video_key] = VIDEO_STATE_FAILED
+            _save_phase2_state(state, state_path)
+            return False, local_video_path
 
-    for retry_index, failed_group in enumerate(failed_groups, start=1):
-        patient_id = failed_group["patient_id"]
-        video_filename = failed_group["video_filename"]
-        video_rows_df = failed_group["video_rows_df"]
-        local_video_path = failed_group["local_video_path"]
+    with tqdm(
+        total=total_videos,
+        initial=_phase2_state_done_count(state),
+        desc="Procesando videos",
+        unit="video",
+        dynamic_ncols=True,
+    ) as progress_bar:
+        refresh_progress(progress_bar)
 
-        print(f"\n[retry {retry_index}/{len(failed_groups)}] Processing {patient_id} | {video_filename}")
-
-        if local_video_path is None:
-            local_video_path = download_video_to_temp(patient_id=patient_id, video_name=video_filename)
-            if local_video_path is None:
-                print("Retry failed because the video could not be downloaded.")
-                still_failed_groups.append(
+        for video_key, patient_id, video_filename, video_rows_df in work_items:
+            processed, local_video_path = process_video_group(
+                video_key=video_key,
+                patient_id=patient_id,
+                video_filename=video_filename,
+                video_rows_df=video_rows_df,
+            )
+            if processed:
+                videos_processed_first_pass += 1
+            else:
+                failed_groups.append(
                     {
+                        "video_key": video_key,
                         "patient_id": patient_id,
                         "video_filename": video_filename,
-                        "local_video_path": None,
+                        "video_rows_df": video_rows_df,
+                        "local_video_path": local_video_path,
                     }
                 )
-                continue
 
-        try:
-            augmented_video_df = ingestor.augment_video_rows(
-                video_path=local_video_path,
-                metadata_rows=video_rows_df,
-            )
-            recovered_groups.append(augmented_video_df)
-            delete_temp_video(local_video_path)
-        except Exception as error:
-            print(f"\nRetry failed for {patient_id} | {video_filename}: {error}")
-            print(f"Keeping local video for inspection: {local_video_path}")
-            still_failed_groups.append(
-                {
-                    "patient_id": patient_id,
-                    "video_filename": video_filename,
-                    "local_video_path": local_video_path,
-                }
-            )
+            progress_bar.update(1)
+            refresh_progress(progress_bar)
 
-    all_groups = [*augmented_groups, *recovered_groups]
-    if all_groups:
-        augmented_df = _finalize_phase2_output_columns(
-            pd.concat(all_groups, ignore_index=True)
-        )
-    else:
-        augmented_df = _finalize_phase2_output_columns(sorted_df)
+    if failed_groups:
+        with tqdm(
+            total=len(failed_groups),
+            desc="Reintentando videos",
+            unit="video",
+            dynamic_ncols=True,
+        ) as retry_bar:
+            refresh_progress(retry_bar)
 
-    write_csv(augmented_df, output_csv_path)
+            for failed_group in failed_groups:
+                video_key = failed_group["video_key"]
+                patient_id = failed_group["patient_id"]
+                video_filename = failed_group["video_filename"]
+                video_rows_df = failed_group["video_rows_df"]
+                local_video_path = failed_group["local_video_path"]
+
+                processed, _ = process_video_group(
+                    video_key=video_key,
+                    patient_id=patient_id,
+                    video_filename=video_filename,
+                    video_rows_df=video_rows_df,
+                    local_video_path=local_video_path,
+                )
+                if processed:
+                    videos_recovered_second_pass += 1
+
+                retry_bar.update(1)
+                refresh_progress(retry_bar)
+
+    output_df = _read_phase2_output_or_baseline(output_csv_path, sorted_df)
+    _save_phase2_state(state, state_path)
 
     return {
-        "videos_processed_first_pass": len(augmented_groups),
-        "videos_recovered_second_pass": len(recovered_groups),
-        "videos_still_failed": len(still_failed_groups),
-        "rows_output": len(augmented_df),
+        "videos_processed_first_pass": videos_processed_first_pass,
+        "videos_recovered_second_pass": videos_recovered_second_pass,
+        "videos_still_failed": _phase2_state_failed_count(state),
+        "videos_done": _phase2_state_done_count(state),
+        "videos_pending": _phase2_state_pending_count(state),
+        "ingestion_complete": _phase2_state_is_complete(state, output_csv_path),
+        "rows_output": len(output_df),
         "output_csv_path": str(output_csv_path),
+        "state_json_path": str(state_path),
     }

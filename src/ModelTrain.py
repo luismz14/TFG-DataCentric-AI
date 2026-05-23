@@ -110,7 +110,7 @@ class EvaluationResult:
 class BestCheckpoint:
     """Best model state seen during training."""
 
-    rank_score: float = -1.0
+    validation_score: float = float("inf")
     macro_f1: float = -1.0
     epoch: int = 0
     val_loss: float = float("inf")
@@ -290,12 +290,6 @@ class PolypDataset(Dataset):
 def build_transforms(
     config: TrainingConfig,
 ) -> tuple[transforms.Compose, transforms.Compose]:
-    """Create conservative train/validation transforms.
-
-    Augmentations stay mild because the clinically relevant cues are subtle and
-    aggressive photometric or geometric changes could erase them.
-    """
-
     normalize = transforms.Normalize(
         mean=[0.485, 0.456, 0.406],
         std=[0.229, 0.224, 0.225],
@@ -304,26 +298,23 @@ def build_transforms(
     train_transform = transforms.Compose(
         [
             transforms.ToPILImage(),
-            transforms.RandomResizedCrop(
-                config.input_size,
-                scale=(0.90, 1.0),
-                ratio=(0.95, 1.05),
+            transforms.Resize(
+                (config.input_size, config.input_size),
                 interpolation=transforms.InterpolationMode.BICUBIC,
             ),
-            transforms.RandomHorizontalFlip(p=0.5),
             transforms.RandomVerticalFlip(p=0.5),
-            transforms.RandomRotation(
-                degrees=10,
+            transforms.RandomHorizontalFlip(p=0.2),
+            transforms.RandomAffine(
+                degrees=8,
+                translate=(0.03, 0.03),
+                scale=(0.97, 1.03),
                 interpolation=transforms.InterpolationMode.BICUBIC,
             ),
             transforms.ColorJitter(
-                brightness=0.10,
-                contrast=0.10,
-                saturation=0.05,
-            ),
-            transforms.RandomAdjustSharpness(
-                sharpness_factor=1.5,
-                p=0.15,
+                brightness=0.12,
+                contrast=0.12,
+                saturation=0.04,
+                hue=0.01,
             ),
             transforms.ToTensor(),
             normalize,
@@ -334,10 +325,9 @@ def build_transforms(
         [
             transforms.ToPILImage(),
             transforms.Resize(
-                config.val_resize_size,
+                (config.input_size, config.input_size),
                 interpolation=transforms.InterpolationMode.BICUBIC,
             ),
-            transforms.CenterCrop(config.input_size),
             transforms.ToTensor(),
             normalize,
         ]
@@ -506,7 +496,7 @@ def build_optimizer(
 
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
-        mode="max",
+        mode="min",
         factor=config.scheduler_factor,
         patience=config.scheduler_patience,
         min_lr=config.min_lr,
@@ -616,52 +606,40 @@ def evaluate_model(
     )
 
 
-def compute_epoch_ranking_scores(
-    val_metrics: list[float],
+def compute_validation_scores(
+    val_macro_f1_scores: list[float],
     val_losses: list[float],
 ) -> np.ndarray:
-    """Score epochs by equal-weight validation metric and validation-loss ranks."""
-    if len(val_metrics) != len(val_losses):
-        raise ValueError("Validation metrics and losses must have the same length.")
+    """Compute validation scores where lower is better."""
+    if len(val_macro_f1_scores) != len(val_losses):
+        raise ValueError("Validation macro-F1 scores and losses must match in length.")
 
-    if not val_metrics:
+    if not val_macro_f1_scores:
         return np.array([], dtype=float)
 
-    metric_values = np.asarray(val_metrics, dtype=float)
+    f1_values = np.asarray(val_macro_f1_scores, dtype=float)
     loss_values = np.asarray(val_losses, dtype=float)
-    if len(metric_values) == 1:
-        return np.ones(1, dtype=float)
-
-    denominator = max(1, len(metric_values) - 1)
-
-    metric_rank = metric_values.argsort().argsort().astype(float) / denominator
-    loss_rank = (-loss_values).argsort().argsort().astype(float) / denominator
-
-    return 0.5 * metric_rank + 0.5 * loss_rank
+    return loss_values * (1.0 - f1_values)
 
 
-def select_best_epoch_by_validation_ranking(
-    val_metrics: list[float],
+def select_best_epoch_by_validation_score(
+    val_macro_f1_scores: list[float],
     val_losses: list[float],
 ) -> tuple[int, np.ndarray]:
-    """Return the best epoch index and all equal-weight ranking scores.
-
-    Ties in the combined ranking score are resolved by choosing the epoch with
-    the lowest validation loss.
-    """
-    scores = compute_epoch_ranking_scores(val_metrics, val_losses)
+    """Return the best epoch index using val_loss * (1 - macro_f1)."""
+    scores = compute_validation_scores(val_macro_f1_scores, val_losses)
 
     if len(scores) == 0:
         raise ValueError("At least one evaluated epoch is required.")
 
-    best_score = scores.max()
+    best_score = scores.min()
     candidate_indices = np.flatnonzero(scores == best_score)
 
     if len(candidate_indices) == 1:
         return int(candidate_indices[0]), scores
 
-    loss_values = np.asarray(val_losses, dtype=float)
-    best_candidate_idx = candidate_indices[np.argmin(loss_values[candidate_indices])]
+    f1_values = np.asarray(val_macro_f1_scores, dtype=float)
+    best_candidate_idx = candidate_indices[np.argmax(f1_values[candidate_indices])]
     return int(best_candidate_idx), scores
 
 
@@ -873,18 +851,16 @@ def train(
         torch.save(model.state_dict(), epoch_checkpoint_path)
         history_checkpoint_paths.append(epoch_checkpoint_path)
 
-        scheduler.step(validation_result.macro_f1)
-
-        current_best_epoch_idx, ranking_scores = (
-            select_best_epoch_by_validation_ranking(
-                history_val_f1,
-                history_val_loss,
-            )
+        current_best_epoch_idx, validation_scores = select_best_epoch_by_validation_score(
+            history_val_f1,
+            history_val_loss,
         )
-        current_rank_score = float(ranking_scores[-1])
-        best_rank_score = float(ranking_scores[current_best_epoch_idx])
+        current_validation_score = float(validation_scores[-1])
+        best_validation_score = float(validation_scores[current_best_epoch_idx])
 
-        best_checkpoint.rank_score = best_rank_score
+        scheduler.step(current_validation_score)
+
+        best_checkpoint.validation_score = best_validation_score
         best_checkpoint.macro_f1 = history_val_f1[current_best_epoch_idx]
         best_checkpoint.epoch = current_best_epoch_idx + 1
         best_checkpoint.val_loss = history_val_loss[current_best_epoch_idx]
@@ -895,8 +871,8 @@ def train(
             current_best_epoch_idx
         ]
 
-        current_epoch_is_rank_best = current_best_epoch_idx == len(history_val_f1) - 1
-        checkpoint_status = " [rank-best]" if current_epoch_is_rank_best else ""
+        current_epoch_is_best = current_best_epoch_idx == len(history_val_f1) - 1
+        checkpoint_status = " [best]" if current_epoch_is_best else ""
         if saved_best_epoch_idx != current_best_epoch_idx:
             shutil.copy2(
                 history_checkpoint_paths[current_best_epoch_idx],
@@ -904,7 +880,7 @@ def train(
             )
             saved_best_epoch_idx = current_best_epoch_idx
 
-        if current_epoch_is_rank_best:
+        if current_epoch_is_best:
             epochs_without_improvement = 0
         else:
             epochs_without_improvement += 1
@@ -914,8 +890,8 @@ def train(
                 "Stage": training_stage,
                 "Train Loss": f"{epoch_train_loss:.4f}",
                 "Val Loss": f"{validation_result.loss:.4f}",
-                "Val Macro F1": f"{validation_result.macro_f1:.4f}",
-                "Rank Score": f"{current_rank_score:.4f}{checkpoint_status}",
+                "Val Macro F1": f"{validation_result.macro_f1:.4f}{checkpoint_status}",
+                "Val Score": f"{current_validation_score:.4f}",
                 "Best Epoch": best_checkpoint.epoch,
                 "LR": format_learning_rates(optimizer),
             }
@@ -929,7 +905,7 @@ def train(
             print(
                 "Early stopping triggered after "
                 f"{config.early_stopping_patience} epochs without improving "
-                "the validation ranking score."
+                "the validation score."
             )
             break
 
@@ -937,11 +913,11 @@ def train(
         shutil.rmtree(checkpoint_dir, ignore_errors=True)
         raise RuntimeError("Training finished without producing a valid checkpoint.")
 
-    best_epoch_idx, ranking_scores = select_best_epoch_by_validation_ranking(
+    best_epoch_idx, validation_scores = select_best_epoch_by_validation_score(
         history_val_f1,
         history_val_loss,
     )
-    best_checkpoint.rank_score = float(ranking_scores[best_epoch_idx])
+    best_checkpoint.validation_score = float(validation_scores[best_epoch_idx])
     best_checkpoint.macro_f1 = history_val_f1[best_epoch_idx]
     best_checkpoint.epoch = best_epoch_idx + 1
     best_checkpoint.val_loss = history_val_loss[best_epoch_idx]
@@ -961,7 +937,7 @@ def train(
         "Optimization sequence completed. "
         f"Selected checkpoint macro-F1: {best_checkpoint.macro_f1:.4f} "
         f"with validation loss {best_checkpoint.val_loss:.4f} "
-        f"and rank score {best_checkpoint.rank_score:.4f} "
+        f"and validation score {best_checkpoint.validation_score:.4f} "
         f"at epoch {best_checkpoint.epoch}."
     )
 

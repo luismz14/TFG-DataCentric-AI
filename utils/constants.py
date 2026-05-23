@@ -19,9 +19,9 @@ BASELINE_CONFIG = ModelTrain.TrainingConfig(
     num_epochs=200,
 
     warmup_epochs=3,
-    head_lr=1e-3, 
+    head_lr=1e-4, 
     fine_tune_head_lr=1e-4,
-    backbone_lr=1e-5,
+    backbone_lr=1e-6,
 
     weight_decay=5e-4,
     dropout=0.3,
@@ -31,7 +31,7 @@ BASELINE_CONFIG = ModelTrain.TrainingConfig(
     scheduler_factor=0.5,
     scheduler_patience=4,
     early_stopping_patience=12,
-    min_lr=1e-6,
+    min_lr=1e-7,
     gradient_clip_norm=1.0,
 
     use_weighted_loss=False,

@@ -55,3 +55,5 @@ utils/Informe_final_ejemplo.pdf
 
 # Logs
 *.log
+
+data/test/external_test_images/

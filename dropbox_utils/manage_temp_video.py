@@ -19,7 +19,7 @@ dbx = dropbox.Dropbox(
     oauth2_refresh_token=REFRESH_TOKEN
 )
 
-def download_video_to_temp(patient_id, video_name):
+def download_video_to_temp(patient_id, video_name, verbose=True):
     """
     Downloads a specific video to a temporary folder and returns its local path.
     
@@ -38,18 +38,20 @@ def download_video_to_temp(patient_id, video_name):
     local_video_path = os.path.abspath(os.path.join(temp_folder, video_name))
 
     if os.path.exists(local_video_path) and os.path.getsize(local_video_path) > 0:
-        print(f"Reusing local video: {local_video_path}")
+        if verbose:
+            print(f"Reusing local video: {local_video_path}")
         return local_video_path
     
     # Robust construction of the Dropbox path
     # We assume the structure is /PatientID/VideoName inside the shared link
     dropbox_path = f"/{patient_id}/{video_name}"
     
-    print(f"⬇️  Starting download: {video_name} ...")
+    if verbose:
+        print(f"⬇️  Starting download: {video_name} ...")
     
     try:
-        # Direct download from the Shared Link
-        # This streams the file to memory first, then writes to disk
+        # Direct download from the Shared Link. Write in chunks to avoid
+        # keeping the full video in memory.
         metadata, res = dbx.sharing_get_shared_link_file(
             url=URL,
             path=dropbox_path,
@@ -57,21 +59,25 @@ def download_video_to_temp(patient_id, video_name):
         )
         
         with open(local_video_path, "wb") as f:
-            f.write(res.content)
+            for chunk in res.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    f.write(chunk)
             
         size_mb = metadata.size / (1024 * 1024)
-        print(f"✅ Download complete: {local_video_path} ({size_mb:.2f} MB)")
+        if verbose:
+            print(f"✅ Download complete: {local_video_path} ({size_mb:.2f} MB)")
         return local_video_path
 
     except Exception as e:
-        print(f"❌ Error downloading {video_name}: {e}")
+        if verbose:
+            print(f"❌ Error downloading {video_name}: {e}")
         # Preventive cleanup if the file was partially created
         if os.path.exists(local_video_path):
             os.remove(local_video_path)
         return None
 
 
-def delete_temp_video(local_path):
+def delete_temp_video(local_path, verbose=True):
     """
     Deletes the temporary video from the disk.
     It handles PermissionError specifically (common with OpenCV on Windows).
@@ -85,17 +91,21 @@ def delete_temp_video(local_path):
     if os.path.exists(local_path):
         try:
             os.remove(local_path)
-            print(f"🗑️  File deleted: {os.path.basename(local_path)}")
+            if verbose:
+                print(f"🗑️  File deleted: {os.path.basename(local_path)}")
             return True
         
         except PermissionError:
-            print(f"⚠️  PERMISSION DENIED: Could not delete {local_path}.")
-            print("    Ensure you called 'cap.release()' in OpenCV before calling this function.")
+            if verbose:
+                print(f"⚠️  PERMISSION DENIED: Could not delete {local_path}.")
+                print("    Ensure you called 'cap.release()' in OpenCV before calling this function.")
             return False
             
         except Exception as e:
-            print(f"⚠️  Error deleting file: {e}")
+            if verbose:
+                print(f"⚠️  Error deleting file: {e}")
             return False
     else:
-        print(f"⚠️  File does not exist, skipping deletion: {local_path}")
+        if verbose:
+            print(f"⚠️  File does not exist, skipping deletion: {local_path}")
         return True
