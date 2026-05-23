@@ -34,5 +34,6 @@ BASELINE_CONFIG = ModelTrain.TrainingConfig(
     min_lr=1e-6,
     gradient_clip_norm=1.0,
 
-    class_weight_exponent=1.0
+    use_weighted_loss=False,
+    class_weight_exponent=0.5
 )

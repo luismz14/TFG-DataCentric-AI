@@ -11,6 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import random
+import shutil
+import tempfile
 
 import cv2
 import matplotlib.pyplot as plt
@@ -90,7 +92,7 @@ class TrainingConfig:
     min_lr: float = 1e-6
     gradient_clip_norm: float = 1.0
 
-    # Imbalance handling shared by the weighted loss and weighted sampler.
+    use_weighted_loss: bool = False
     class_weight_exponent: float = 0.5
 
 
@@ -108,8 +110,8 @@ class EvaluationResult:
 class BestCheckpoint:
     """Best model state seen during training."""
 
+    rank_score: float = -1.0
     macro_f1: float = -1.0
-    smoothed_macro_f1: float = -1.0
     epoch: int = 0
     val_loss: float = float("inf")
     confusion_matrix: np.ndarray | None = None
@@ -458,9 +460,13 @@ def build_criterion(
     train_metadata_df: pd.DataFrame,
     config: TrainingConfig,
     device: torch.device,
-) -> tuple[nn.CrossEntropyLoss, torch.Tensor]:
-    """Create the weighted cross-entropy loss used by the baseline."""
-    loss_weights = build_loss_weights(train_metadata_df, config).to(device)
+) -> tuple[nn.CrossEntropyLoss, torch.Tensor | None]:
+    """Create the cross-entropy loss used by the baseline."""
+    loss_weights = (
+        build_loss_weights(train_metadata_df, config).to(device)
+        if config.use_weighted_loss
+        else None
+    )
 
     criterion = nn.CrossEntropyLoss(
         weight=loss_weights,
@@ -610,6 +616,56 @@ def evaluate_model(
     )
 
 
+def compute_epoch_ranking_scores(
+    val_metrics: list[float],
+    val_losses: list[float],
+) -> np.ndarray:
+    """Score epochs by equal-weight validation metric and validation-loss ranks."""
+    if len(val_metrics) != len(val_losses):
+        raise ValueError("Validation metrics and losses must have the same length.")
+
+    if not val_metrics:
+        return np.array([], dtype=float)
+
+    metric_values = np.asarray(val_metrics, dtype=float)
+    loss_values = np.asarray(val_losses, dtype=float)
+    if len(metric_values) == 1:
+        return np.ones(1, dtype=float)
+
+    denominator = max(1, len(metric_values) - 1)
+
+    metric_rank = metric_values.argsort().argsort().astype(float) / denominator
+    loss_rank = (-loss_values).argsort().argsort().astype(float) / denominator
+
+    return 0.5 * metric_rank + 0.5 * loss_rank
+
+
+def select_best_epoch_by_validation_ranking(
+    val_metrics: list[float],
+    val_losses: list[float],
+) -> tuple[int, np.ndarray]:
+    """Return the best epoch index and all equal-weight ranking scores.
+
+    Ties in the combined ranking score are resolved by choosing the epoch with
+    the lowest validation loss.
+    """
+    scores = compute_epoch_ranking_scores(val_metrics, val_losses)
+
+    if len(scores) == 0:
+        raise ValueError("At least one evaluated epoch is required.")
+
+    best_score = scores.max()
+    candidate_indices = np.flatnonzero(scores == best_score)
+
+    if len(candidate_indices) == 1:
+        return int(candidate_indices[0]), scores
+
+    loss_values = np.asarray(val_losses, dtype=float)
+    best_candidate_idx = candidate_indices[np.argmin(loss_values[candidate_indices])]
+    return int(best_candidate_idx), scores
+
+
+
 def plot_and_save_metrics(
     train_losses: list[float],
     val_losses: list[float],
@@ -725,14 +781,14 @@ def train(
     )
 
     criterion, loss_weights = build_criterion(train_metadata_df, config, device)
-    print()
-    print(
-        "Loss weights:",
-        {
-            class_name: round(float(weight), 4)
-            for class_name, weight in zip(CLASS_NAMES, loss_weights.cpu())
-        },
-    )
+    if loss_weights is not None:
+        print(
+            "Loss weights:",
+            {
+                class_name: round(float(weight), 4)
+                for class_name, weight in zip(CLASS_NAMES, loss_weights.cpu())
+            },
+        )
 
     model = PolypClassifier(
         num_classes=len(CLASS_NAMES),
@@ -749,15 +805,18 @@ def train(
     history_train_loss: list[float] = []
     history_val_loss: list[float] = []
     history_val_f1: list[float] = []
+    history_confusion_matrices: list[np.ndarray] = []
+    history_classification_reports: list[str] = []
+    history_checkpoint_paths: list[Path] = []
     history_lr: dict[str, list[float]] = {}
 
     best_checkpoint = BestCheckpoint()
+    saved_best_epoch_idx: int | None = None
     epochs_without_improvement = 0
-    smoothed_macro_f1: float | None = None
     best_model_weights_path = experiment_dir / "best_baseline_model.pth"
-    monitor_alpha = 0.30
-    f1_tie_tolerance = 0.002
-    loss_min_delta = 0.005
+    checkpoint_dir = Path(
+        tempfile.mkdtemp(prefix=".epoch_checkpoints_", dir=experiment_dir)
+    )
 
     print(f"Initiating training phase. Saving results to: {experiment_dir}")
     progress_bar = tqdm(range(config.num_epochs), desc="Training Progress", unit="epoch")
@@ -769,8 +828,6 @@ def train(
                 config,
                 full_fine_tune=True,
             )
-            print()
-            print(f"Switching to full-network fine-tuning at epoch {epoch + 1}.")
 
         current_lrs = get_learning_rate_snapshot(optimizer)
 
@@ -809,43 +866,46 @@ def train(
         history_train_loss.append(epoch_train_loss)
         history_val_loss.append(validation_result.loss)
         history_val_f1.append(validation_result.macro_f1)
+        history_confusion_matrices.append(validation_result.confusion_matrix)
+        history_classification_reports.append(validation_result.classification_report)
 
-        if smoothed_macro_f1 is None:
-            smoothed_macro_f1 = validation_result.macro_f1
-        else:
-            smoothed_macro_f1 = (
-                monitor_alpha * validation_result.macro_f1
-                + (1.0 - monitor_alpha) * smoothed_macro_f1
+        epoch_checkpoint_path = checkpoint_dir / f"epoch_{epoch + 1:04d}.pth"
+        torch.save(model.state_dict(), epoch_checkpoint_path)
+        history_checkpoint_paths.append(epoch_checkpoint_path)
+
+        scheduler.step(validation_result.macro_f1)
+
+        current_best_epoch_idx, ranking_scores = (
+            select_best_epoch_by_validation_ranking(
+                history_val_f1,
+                history_val_loss,
             )
+        )
+        current_rank_score = float(ranking_scores[-1])
+        best_rank_score = float(ranking_scores[current_best_epoch_idx])
 
-        scheduler.step(smoothed_macro_f1)
+        best_checkpoint.rank_score = best_rank_score
+        best_checkpoint.macro_f1 = history_val_f1[current_best_epoch_idx]
+        best_checkpoint.epoch = current_best_epoch_idx + 1
+        best_checkpoint.val_loss = history_val_loss[current_best_epoch_idx]
+        best_checkpoint.confusion_matrix = history_confusion_matrices[
+            current_best_epoch_idx
+        ]
+        best_checkpoint.classification_report = history_classification_reports[
+            current_best_epoch_idx
+        ]
 
-        improved_smoothed_f1 = (
-            smoothed_macro_f1 > best_checkpoint.smoothed_macro_f1 + 1e-4
-        )
-        similar_smoothed_f1 = (
-            smoothed_macro_f1 >= best_checkpoint.smoothed_macro_f1 - f1_tie_tolerance
-        )
-        improved_val_loss = (
-            validation_result.loss < best_checkpoint.val_loss - loss_min_delta
-        )
-        is_better_checkpoint = improved_smoothed_f1 or (
-            similar_smoothed_f1 and improved_val_loss
-        )
-
-        checkpoint_status = ""
-        if is_better_checkpoint:
-            best_checkpoint.macro_f1 = validation_result.macro_f1
-            best_checkpoint.smoothed_macro_f1 = smoothed_macro_f1
-            best_checkpoint.epoch = epoch + 1
-            best_checkpoint.val_loss = validation_result.loss
-            best_checkpoint.confusion_matrix = validation_result.confusion_matrix
-            best_checkpoint.classification_report = (
-                validation_result.classification_report
+        current_epoch_is_rank_best = current_best_epoch_idx == len(history_val_f1) - 1
+        checkpoint_status = " [rank-best]" if current_epoch_is_rank_best else ""
+        if saved_best_epoch_idx != current_best_epoch_idx:
+            shutil.copy2(
+                history_checkpoint_paths[current_best_epoch_idx],
+                best_model_weights_path,
             )
+            saved_best_epoch_idx = current_best_epoch_idx
+
+        if current_epoch_is_rank_best:
             epochs_without_improvement = 0
-            torch.save(model.state_dict(), best_model_weights_path)
-            checkpoint_status = " [saved]"
         else:
             epochs_without_improvement += 1
 
@@ -854,8 +914,9 @@ def train(
                 "Stage": training_stage,
                 "Train Loss": f"{epoch_train_loss:.4f}",
                 "Val Loss": f"{validation_result.loss:.4f}",
-                "Val F1": f"{validation_result.macro_f1:.4f}{checkpoint_status}",
-                "Smooth F1": f"{smoothed_macro_f1:.4f}",
+                "Val Macro F1": f"{validation_result.macro_f1:.4f}",
+                "Rank Score": f"{current_rank_score:.4f}{checkpoint_status}",
+                "Best Epoch": best_checkpoint.epoch,
                 "LR": format_learning_rates(optimizer),
             }
         )
@@ -868,21 +929,39 @@ def train(
             print(
                 "Early stopping triggered after "
                 f"{config.early_stopping_patience} epochs without improving "
-                "smoothed macro-F1 or validation loss."
+                "the validation ranking score."
             )
             break
 
-    if best_model_weights_path.exists():
-        model.load_state_dict(torch.load(best_model_weights_path, map_location=device))
-
-    if best_checkpoint.confusion_matrix is None:
+    if not history_checkpoint_paths or best_checkpoint.confusion_matrix is None:
+        shutil.rmtree(checkpoint_dir, ignore_errors=True)
         raise RuntimeError("Training finished without producing a valid checkpoint.")
+
+    best_epoch_idx, ranking_scores = select_best_epoch_by_validation_ranking(
+        history_val_f1,
+        history_val_loss,
+    )
+    best_checkpoint.rank_score = float(ranking_scores[best_epoch_idx])
+    best_checkpoint.macro_f1 = history_val_f1[best_epoch_idx]
+    best_checkpoint.epoch = best_epoch_idx + 1
+    best_checkpoint.val_loss = history_val_loss[best_epoch_idx]
+    best_checkpoint.confusion_matrix = history_confusion_matrices[best_epoch_idx]
+    best_checkpoint.classification_report = history_classification_reports[
+        best_epoch_idx
+    ]
+
+    model.load_state_dict(
+        torch.load(history_checkpoint_paths[best_epoch_idx], map_location=device)
+    )
+    torch.save(model.state_dict(), best_model_weights_path)
+    shutil.rmtree(checkpoint_dir, ignore_errors=True)
 
     print()
     print(
         "Optimization sequence completed. "
         f"Selected checkpoint macro-F1: {best_checkpoint.macro_f1:.4f} "
-        f"(smoothed: {best_checkpoint.smoothed_macro_f1:.4f}) "
+        f"with validation loss {best_checkpoint.val_loss:.4f} "
+        f"and rank score {best_checkpoint.rank_score:.4f} "
         f"at epoch {best_checkpoint.epoch}."
     )
 
