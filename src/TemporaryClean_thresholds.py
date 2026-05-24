@@ -20,7 +20,7 @@ BBOX_AREA_WEIGHT = 0.20
 DETECTION_CONFIDENCE_WEIGHT = 0.50
 
 
-def phase4_handler(
+def run_deduplication_pipeline(
     metadata_path: str | Path,
     images_dir: str | Path,
     output_path: str | Path | None = None,
@@ -130,7 +130,7 @@ def deduplication_handler(
     This neutral name is used by the notebook phase numbering in the report.
     """
 
-    return phase4_handler(
+    return run_deduplication_pipeline(
         metadata_path=metadata_path,
         images_dir=images_dir,
         output_path=output_path,

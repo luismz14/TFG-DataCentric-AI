@@ -24,22 +24,28 @@ from src.phase0.crop import (
     detect_clinical_area,
 )
 from utils.common import read_csv, validate_required_columns, write_csv
+from utils.constants import BASE_METADATA_COLUMNS, CLASS_NAMES
 
 
-HISTOLOGY_ORDER = [
-    "Adenoma",
-    "Sessile_serrated_adenoma",
-    "Hyperplastic",
-    "Adenocarcinoma",
+PHASE2_HISTOLOGY_ORDER = CLASS_NAMES
+PHASE2_PROGRESS_HISTOLOGY_LABELS = {
+    "Adenoma": "Adenoma",
+    "Sessile_serrated_adenoma": "SSA",
+    "Hyperplastic": "Hyperplastic",
+    "Adenocarcinoma": "Adenocarcinoma",
+}
+
+PHASE2_EXTRA_METADATA_REQUIRED_COLUMNS = [
+    "video_filename",
+    "elapsed_seconds",
+]
+PHASE2_BASE_METADATA_REQUIRED_COLUMNS = BASE_METADATA_COLUMNS
+PHASE2_METADATA_REQUIRED_COLUMNS = [
+    *PHASE2_BASE_METADATA_REQUIRED_COLUMNS,
+    *PHASE2_EXTRA_METADATA_REQUIRED_COLUMNS,
 ]
 
-PHASE2_OUTPUT_COLUMNS = [
-    "filename",
-    "histology",
-    "patient_id",
-    "day",
-    "R",
-    "F",
+PHASE2_OUTPUT_EXTRA_COLUMNS = [
     "video_filename",
     "elapsed_seconds",
     "crop_x",
@@ -50,72 +56,38 @@ PHASE2_OUTPUT_COLUMNS = [
     "detection_confidence",
     "bbox_area_ratio",
 ]
-
-_PROGRESS_HISTOLOGY_LABELS = {
-    "Adenoma": "Adenoma",
-    "Sessile_serrated_adenoma": "SSA",
-    "Hyperplastic": "Hyperplastic",
-    "Adenocarcinoma": "Adenocarcinoma",
-}
+PHASE2_OUTPUT_COLUMNS = [
+    *PHASE2_BASE_METADATA_REQUIRED_COLUMNS,
+    *PHASE2_OUTPUT_EXTRA_COLUMNS,
+]
 
 PHASE2_STATE_VERSION = 1
-
-# The phase2 JSON intentionally stays small:
-# source_signature + per-video status + class counters for tqdm.
-VIDEO_STATE_PENDING = "pending"
-VIDEO_STATE_RUNNING = "running"
-VIDEO_STATE_DONE = "done"
-VIDEO_STATE_FAILED = "failed"
-VIDEO_RESTARTABLE_STATES = {
-    VIDEO_STATE_PENDING,
-    VIDEO_STATE_RUNNING,
-    VIDEO_STATE_FAILED,
-}
-
-PHASE2_BASE_METADATA_REQUIRED_COLUMNS = [
-    "patient_id",
-    "day",
-    "hour",
-    "R",
-    "F",
-    "histology",
-    "filename",
-]
-
-PHASE2_METADATA_REQUIRED_COLUMNS = [
-    *PHASE2_BASE_METADATA_REQUIRED_COLUMNS,
-    "video_filename",
-    "elapsed_seconds",
-]
-
-DEFAULT_PHASE2_SOURCE_METADATA_PATH = Path("data/phase1_train.csv")
-DEFAULT_DATASET_INVENTORY_PATH = Path("data/dataset_inventory.json")
-
-_PHASE2_COLUMN_DEFAULTS = {
-    "filename": "",
-    "histology": "",
-    "patient_id": "",
-    "day": "",
-    "R": "",
-    "F": "",
-    "video_filename": "",
-    "elapsed_seconds": 0.0,
-    "crop_x": 0,
-    "crop_y": 0,
-    "crop_w": 0,
-    "crop_h": 0,
-    "source_type": "original",
-    "detection_confidence": 0.0,
-    "bbox_area_ratio": 0.0,
+PHASE2_VIDEO_STATE_PENDING = "pending"
+PHASE2_VIDEO_STATE_RUNNING = "running"
+PHASE2_VIDEO_STATE_DONE = "done"
+PHASE2_VIDEO_STATE_FAILED = "failed"
+PHASE2_VIDEO_RESTARTABLE_STATES = {
+    PHASE2_VIDEO_STATE_PENDING,
+    PHASE2_VIDEO_STATE_RUNNING,
+    PHASE2_VIDEO_STATE_FAILED,
 }
 
 
 def _finalize_phase2_output_columns(output_df: pd.DataFrame) -> pd.DataFrame:
     output_df = output_df.copy()
 
-    for column in PHASE2_OUTPUT_COLUMNS:
+    for column in PHASE2_BASE_METADATA_REQUIRED_COLUMNS:
         if column not in output_df.columns:
-            output_df[column] = _PHASE2_COLUMN_DEFAULTS[column]
+            output_df[column] = ""
+    for column in ["video_filename", "source_type"]:
+        if column not in output_df.columns:
+            output_df[column] = ""
+    for column in ["elapsed_seconds", "detection_confidence", "bbox_area_ratio"]:
+        if column not in output_df.columns:
+            output_df[column] = 0.0
+    for column in CROP_COLUMNS:
+        if column not in output_df.columns:
+            output_df[column] = 0
 
     source_type = output_df["source_type"].fillna("original")
     output_df["source_type"] = source_type.mask(
@@ -163,7 +135,7 @@ def build_histology_candidate_summary(
     class_counts = metadata_df["histology"].astype(str).value_counts()
 
     summary_rows = []
-    for histology in HISTOLOGY_ORDER:
+    for histology in PHASE2_HISTOLOGY_ORDER:
         current_samples = int(class_counts.get(histology, 0))
         max_candidates = candidates_per_histology.get(histology, -1)
         max_added_per_sample = max(0, max_candidates)
@@ -197,7 +169,7 @@ def clean_histology_metadata_rows(
         raise ValueError("metadata_rows is missing required column: histology")
 
     normalized_histology = metadata_df["histology"].astype(str).str.strip()
-    valid_mask = normalized_histology.isin(HISTOLOGY_ORDER)
+    valid_mask = normalized_histology.isin(PHASE2_HISTOLOGY_ORDER)
 
     if verbose and (~valid_mask).any():
         invalid_counts = normalized_histology[~valid_mask].value_counts().to_dict()
@@ -208,7 +180,10 @@ def clean_histology_metadata_rows(
     return cleaned_df.reset_index(drop=True)
 
 
-def _load_phase2_metadata(metadata_csv_path: Path) -> pd.DataFrame:
+def _load_phase2_metadata(
+    metadata_csv_path: Path,
+    dataset_inventory_path: str | Path,
+) -> pd.DataFrame:
     metadata_df = read_csv(
         metadata_csv_path,
         dtype=str,
@@ -233,7 +208,7 @@ def _load_phase2_metadata(metadata_csv_path: Path) -> pd.DataFrame:
         format="%Y%m%d%H%M%S",
     )
 
-    videos_df = load_videos(DEFAULT_DATASET_INVENTORY_PATH)
+    videos_df = load_videos(dataset_inventory_path)
     enriched_df = match_videos_to_images(
         baseline_df=base_df,
         videos_df=videos_df,
@@ -291,8 +266,8 @@ def _format_augmentation_progress(
     failed_videos: int,
 ) -> str:
     class_counts = " ".join(
-        f"{_PROGRESS_HISTOLOGY_LABELS[histology]}:{added_counts.get(histology, 0)}"
-        for histology in HISTOLOGY_ORDER
+        f"{PHASE2_PROGRESS_HISTOLOGY_LABELS[histology]}:{added_counts.get(histology, 0)}"
+        for histology in PHASE2_HISTOLOGY_ORDER
     )
     return (
         f"pendientes={pending_videos} "
@@ -302,7 +277,7 @@ def _format_augmentation_progress(
 
 
 def _empty_histology_counts() -> dict[str, int]:
-    return {histology: 0 for histology in HISTOLOGY_ORDER}
+    return {histology: 0 for histology in PHASE2_HISTOLOGY_ORDER}
 
 
 def _phase2_state_path(output_csv_path: Path) -> Path:
@@ -361,7 +336,7 @@ def _build_phase2_video_states(grouped_items: list[tuple]) -> dict[str, str]:
     videos: dict[str, str] = {}
     for (patient_id, video_filename), _ in grouped_items:
         videos[_phase2_video_key(str(patient_id), str(video_filename))] = (
-            VIDEO_STATE_PENDING
+            PHASE2_VIDEO_STATE_PENDING
         )
     return videos
 
@@ -434,15 +409,15 @@ def _load_or_initialize_phase2_state(
 
     changed = False
     for video_key, status in list(state["videos"].items()):
-        if status == VIDEO_STATE_RUNNING:
-            state["videos"][video_key] = VIDEO_STATE_PENDING
+        if status == PHASE2_VIDEO_STATE_RUNNING:
+            state["videos"][video_key] = PHASE2_VIDEO_STATE_PENDING
             changed = True
         elif status not in {
-            VIDEO_STATE_PENDING,
-            VIDEO_STATE_DONE,
-            VIDEO_STATE_FAILED,
+            PHASE2_VIDEO_STATE_PENDING,
+            PHASE2_VIDEO_STATE_DONE,
+            PHASE2_VIDEO_STATE_FAILED,
         }:
-            state["videos"][video_key] = VIDEO_STATE_PENDING
+            state["videos"][video_key] = PHASE2_VIDEO_STATE_PENDING
             changed = True
 
     state["counts_by_histology"] = {
@@ -450,7 +425,7 @@ def _load_or_initialize_phase2_state(
         **{
             histology: int(count)
             for histology, count in state.get("counts_by_histology", {}).items()
-            if histology in HISTOLOGY_ORDER
+            if histology in PHASE2_HISTOLOGY_ORDER
         },
     }
     return state, False, changed
@@ -464,19 +439,19 @@ def _phase2_state_pending_count(state: dict) -> int:
     return sum(
         1
         for status in state.get("videos", {}).values()
-        if status in {VIDEO_STATE_PENDING, VIDEO_STATE_RUNNING}
+        if status in {PHASE2_VIDEO_STATE_PENDING, PHASE2_VIDEO_STATE_RUNNING}
     )
 
 
 def _phase2_state_failed_count(state: dict) -> int:
     return sum(
-        1 for status in state.get("videos", {}).values() if status == VIDEO_STATE_FAILED
+        1 for status in state.get("videos", {}).values() if status == PHASE2_VIDEO_STATE_FAILED
     )
 
 
 def _phase2_state_done_count(state: dict) -> int:
     return sum(
-        1 for status in state.get("videos", {}).values() if status == VIDEO_STATE_DONE
+        1 for status in state.get("videos", {}).values() if status == PHASE2_VIDEO_STATE_DONE
     )
 
 
@@ -558,8 +533,8 @@ def _sync_phase2_state_from_output_csv(
     changed = False
     if not output_csv_path.exists():
         for video_key, status in list(state.get("videos", {}).items()):
-            if status == VIDEO_STATE_DONE:
-                state["videos"][video_key] = VIDEO_STATE_PENDING
+            if status == PHASE2_VIDEO_STATE_DONE:
+                state["videos"][video_key] = PHASE2_VIDEO_STATE_PENDING
                 changed = True
         state["counts_by_histology"] = _empty_histology_counts()
         return changed
@@ -574,8 +549,8 @@ def _sync_phase2_state_from_output_csv(
         )
     except Exception:
         for video_key, status in list(state.get("videos", {}).items()):
-            if status == VIDEO_STATE_DONE:
-                state["videos"][video_key] = VIDEO_STATE_PENDING
+            if status == PHASE2_VIDEO_STATE_DONE:
+                state["videos"][video_key] = PHASE2_VIDEO_STATE_PENDING
                 changed = True
         state["counts_by_histology"] = _empty_histology_counts()
         return changed
@@ -583,7 +558,7 @@ def _sync_phase2_state_from_output_csv(
     added_counts: Counter[str] = Counter()
     for (patient_id, video_filename), _ in grouped_items:
         video_key = _phase2_video_key(str(patient_id), str(video_filename))
-        if state["videos"].get(video_key) != VIDEO_STATE_DONE:
+        if state["videos"].get(video_key) != PHASE2_VIDEO_STATE_DONE:
             continue
 
         video_mask = _phase2_output_video_mask(
@@ -592,14 +567,14 @@ def _sync_phase2_state_from_output_csv(
             video_filename=str(video_filename),
         )
         if not video_mask.any():
-            state["videos"][video_key] = VIDEO_STATE_PENDING
+            state["videos"][video_key] = PHASE2_VIDEO_STATE_PENDING
             changed = True
             continue
 
         added_counts.update(_count_added_rows_by_histology(output_df.loc[video_mask]))
 
     normalized_added_counts = _empty_histology_counts()
-    for histology in HISTOLOGY_ORDER:
+    for histology in PHASE2_HISTOLOGY_ORDER:
         normalized_added_counts[histology] = int(added_counts.get(histology, 0))
 
     if state.get("counts_by_histology") != normalized_added_counts:
@@ -611,7 +586,7 @@ def _sync_phase2_state_from_output_csv(
 
 def _phase2_state_is_complete(state: dict, output_csv_path: Path) -> bool:
     return output_csv_path.exists() and all(
-        status == VIDEO_STATE_DONE for status in state.get("videos", {}).values()
+        status == PHASE2_VIDEO_STATE_DONE for status in state.get("videos", {}).values()
     )
 
 
@@ -1006,13 +981,13 @@ class VideoIngestor:
         class_counts = (
             metadata_df["histology"]
             .value_counts()
-            .reindex(HISTOLOGY_ORDER, fill_value=0)
+            .reindex(PHASE2_HISTOLOGY_ORDER, fill_value=0)
         )
         class_frequencies = class_counts / class_counts.sum()
         majority_frequency = class_frequencies.max()
 
         candidates_per_histology: dict[str, int] = {}
-        for histology in HISTOLOGY_ORDER:
+        for histology in PHASE2_HISTOLOGY_ORDER:
             frequency = class_frequencies[histology]
             candidates = 1 if frequency == 0 else math.ceil(majority_frequency / frequency)
             # The maximum avoids too many redundant frames from the same video.
@@ -1257,22 +1232,24 @@ class VideoIngestor:
 
 def augment_dataset(
     yolo_weights_path: str | Path,
-    metadata_csv_path: str | Path = DEFAULT_PHASE2_SOURCE_METADATA_PATH,
-    output_dir: str | Path = "data/phase2/framesv2",
-    output_csv_path: str | Path = "data/phase2/phase2_trainv2.csv",
-    max_candidates_per_video: int = 100,
-    target_fps: int = 5,
-    window_sec: int = 3,
-    device: str | int = 0,
-    half: bool = True,
-    imgsz: int = 640,
-    max_prefetch_videos: int = 4,
+    metadata_csv_path: str | Path,
+    dataset_inventory_path: str | Path,
+    output_dir: str | Path,
+    output_csv_path: str | Path,
+    max_candidates_per_video: int,
+    target_fps: int,
+    window_sec: int,
+    device: str | int,
+    half: bool,
+    imgsz: int,
+    max_prefetch_videos: int,
 ) -> dict[str, int | str | bool]:
     metadata_csv_path = Path(metadata_csv_path)
+    dataset_inventory_path = Path(dataset_inventory_path)
     output_csv_path = Path(output_csv_path)
     state_path = _phase2_state_path(output_csv_path)
 
-    metadata_df = _load_phase2_metadata(metadata_csv_path)
+    metadata_df = _load_phase2_metadata(metadata_csv_path, dataset_inventory_path)
     metadata_df = clean_histology_metadata_rows(metadata_df, verbose=True)
 
     if metadata_df.empty:
@@ -1363,7 +1340,7 @@ def augment_dataset(
     work_items = []
     for (patient_id, video_filename), video_rows_df in grouped_items:
         video_key = _phase2_video_key(str(patient_id), str(video_filename))
-        if state["videos"][video_key] in VIDEO_RESTARTABLE_STATES:
+        if state["videos"][video_key] in PHASE2_VIDEO_RESTARTABLE_STATES:
             work_items.append((video_key, str(patient_id), str(video_filename), video_rows_df))
 
     ingestor = VideoIngestor(
@@ -1411,7 +1388,7 @@ def augment_dataset(
         local_video_path: str | None = None,
     ) -> tuple[bool, str | None]:
         # Mark before downloading/processing so a crash is visible on resume.
-        state["videos"][video_key] = VIDEO_STATE_RUNNING
+        state["videos"][video_key] = PHASE2_VIDEO_STATE_RUNNING
         _save_phase2_state(state, state_path)
 
         try:
@@ -1432,7 +1409,7 @@ def augment_dataset(
                 video_output_df=augmented_video_df,
             )
 
-            state["videos"][video_key] = VIDEO_STATE_DONE
+            state["videos"][video_key] = PHASE2_VIDEO_STATE_DONE
             # Recalculate counters from CSV instead of incrementing in memory;
             # the CSV is the durable record of generated rows.
             _sync_phase2_state_from_output_csv(
@@ -1445,7 +1422,7 @@ def augment_dataset(
             return True, None
 
         except Exception:
-            state["videos"][video_key] = VIDEO_STATE_FAILED
+            state["videos"][video_key] = PHASE2_VIDEO_STATE_FAILED
             _save_phase2_state(state, state_path)
             return False, local_video_path
 

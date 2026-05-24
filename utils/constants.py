@@ -12,3 +12,4 @@ CLASS_NAMES = [
 LABEL_MAP = {class_name: idx for idx, class_name in enumerate(CLASS_NAMES)}
 
 GROUP_COLUMNS = ["patient_id", "day", "R", "F"]
+BASE_METADATA_COLUMNS = [*GROUP_COLUMNS, "hour", "histology", "filename"]

@@ -20,11 +20,13 @@ BBOX_AREA_WEIGHT = 0.20
 DETECTION_CONFIDENCE_WEIGHT = 0.50
 
 
-def phase4_handler(
+def run_deduplication_pipeline(
     metadata_path: str | Path,
     images_dir: str | Path,
     output_path: str | Path | None = None,
     top_k_by_histology: dict[str, int] | None = None,
+    ssim_threshold: float = SSIM_THRESHOLD,
+    phash_distance_threshold: int = PHASH_DISTANCE_THRESHOLD,
 ) -> dict[str, object]:
     """
     Run the complete deduplication pipeline from a metadata table.
@@ -65,6 +67,8 @@ def phase4_handler(
     similarity_pairs_df = calculate_similarity(
         dataframe=grouped_df,
         images_dir=images_dir,
+        ssim_threshold=ssim_threshold,
+        phash_distance_threshold=phash_distance_threshold,
     )
 
     # 5. Group redundant pairs into redundancy groups
@@ -123,6 +127,8 @@ def deduplication_handler(
     images_dir: str | Path,
     output_path: str | Path | None = None,
     top_k_by_histology: dict[str, int] | None = None,
+    ssim_threshold: float = SSIM_THRESHOLD,
+    phash_distance_threshold: int = PHASH_DISTANCE_THRESHOLD,
 ) -> dict[str, object]:
     """
     Run the visual deduplication pipeline from a metadata table.
@@ -130,11 +136,13 @@ def deduplication_handler(
     This neutral name is used by the notebook phase numbering in the report.
     """
 
-    return phase4_handler(
+    return run_deduplication_pipeline(
         metadata_path=metadata_path,
         images_dir=images_dir,
         output_path=output_path,
         top_k_by_histology=top_k_by_histology,
+        ssim_threshold=ssim_threshold,
+        phash_distance_threshold=phash_distance_threshold,
     )
 
 
