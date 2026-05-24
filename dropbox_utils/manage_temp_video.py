@@ -22,61 +22,76 @@ dbx = dropbox.Dropbox(
 def download_video_to_temp(patient_id, video_name, verbose=True):
     """
     Downloads a specific video to a temporary folder and returns its local path.
-    
+
     Args:
         patient_id (str): The folder name/ID of the patient.
-        video_name (str): The filename of the video (e.g., 'video.mp4').
+        video_name (str): The filename of the video.
 
     Returns:
         str: Absolute path of the downloaded file, or None if an error occurred.
     """
     temp_folder = "../temp_workspace"
-    if not os.path.exists(temp_folder):
-        os.makedirs(temp_folder)
-        
-    # Create absolute path for local storage
-    local_video_path = os.path.abspath(os.path.join(temp_folder, video_name))
+    os.makedirs(temp_folder, exist_ok=True)
+
+    safe_patient_id = str(patient_id).replace(os.sep, "_").replace("/", "_")
+    safe_video_name = str(video_name).replace(os.sep, "_").replace("/", "_")
+    local_filename = f"{safe_patient_id}__{safe_video_name}"
+    local_video_path = os.path.abspath(os.path.join(temp_folder, local_filename))
+    partial_video_path = f"{local_video_path}.part"
 
     if os.path.exists(local_video_path) and os.path.getsize(local_video_path) > 0:
         if verbose:
             print(f"Reusing local video: {local_video_path}")
         return local_video_path
-    
-    # Robust construction of the Dropbox path
-    # We assume the structure is /PatientID/VideoName inside the shared link
+
+    if os.path.exists(partial_video_path):
+        os.remove(partial_video_path)
+
     dropbox_path = f"/{patient_id}/{video_name}"
-    
+
     if verbose:
-        print(f"⬇️  Starting download: {video_name} ...")
-    
+        print(f"Starting download: {video_name} ...")
+
     try:
-        # Direct download from the Shared Link. Write in chunks to avoid
-        # keeping the full video in memory.
         metadata, res = dbx.sharing_get_shared_link_file(
             url=URL,
             path=dropbox_path,
-            link_password=PASSWORD
+            link_password=PASSWORD,
         )
-        
-        with open(local_video_path, "wb") as f:
+
+        with open(partial_video_path, "wb") as f:
             for chunk in res.iter_content(chunk_size=1024 * 1024):
                 if chunk:
                     f.write(chunk)
-            
-        size_mb = metadata.size / (1024 * 1024)
+
+        downloaded_size = os.path.getsize(partial_video_path)
+        if downloaded_size != metadata.size:
+            raise OSError(
+                f"Incomplete download for {video_name}: "
+                f"{downloaded_size} of {metadata.size} bytes"
+            )
+
+        os.replace(partial_video_path, local_video_path)
+
         if verbose:
-            print(f"✅ Download complete: {local_video_path} ({size_mb:.2f} MB)")
+            size_mb = metadata.size / (1024 * 1024)
+            print(f"Download complete: {local_video_path} ({size_mb:.2f} MB)")
+
         return local_video_path
 
     except Exception as e:
         if verbose:
-            print(f"❌ Error downloading {video_name}: {e}")
-        # Preventive cleanup if the file was partially created
-        if os.path.exists(local_video_path):
+            print(f"Error downloading {video_name}: {e}")
+
+        if os.path.exists(partial_video_path):
+            os.remove(partial_video_path)
+
+        if os.path.exists(local_video_path) and os.path.getsize(local_video_path) == 0:
             os.remove(local_video_path)
+
         return None
-
-
+    
+    
 def delete_temp_video(local_path, verbose=True):
     """
     Deletes the temporary video from the disk.

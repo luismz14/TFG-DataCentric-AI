@@ -1,14 +1,16 @@
-import math
-import sys
-
-sys.path.append("..")
-
 import hashlib
 import json
+import math
+import os
+import shutil
+import sys
 import uuid
 from collections import Counter
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
+
+sys.path.append("..")
 
 import cv2
 import pandas as pd
@@ -319,6 +321,8 @@ def _build_phase2_source_signature(
     max_candidates_per_video: int,
     target_fps: int,
     window_sec: int,
+    half: bool,
+    imgsz: int,
 ) -> str:
     """Hash the input rows and relevant config so stale state is not reused."""
     signature_columns = [
@@ -334,6 +338,8 @@ def _build_phase2_source_signature(
             "target_fps": int(target_fps),
             "window_sec": int(window_sec),
             "yolo_weights_path": str(Path(yolo_weights_path)),
+            "half": bool(half),
+            "imgsz": int(imgsz),
         },
         "rows": json.loads(
             signature_df.to_json(
@@ -623,6 +629,9 @@ class VideoIngestor:
         base_histology: str = "Adenoma",
         base_candidates: int = 1,
         candidate_exponent: float = 1.0,
+        device: str | int = 0,
+        half: bool = True,
+        imgsz: int = 640,
     ):
         from ultralytics import YOLO
 
@@ -639,7 +648,20 @@ class VideoIngestor:
         self.base_histology = base_histology
         self.base_candidates = base_candidates
         self.candidate_exponent = candidate_exponent
+        self.device = device
+        self.half = half
+        self.imgsz = imgsz
         self.candidates_per_histology: dict[str, int] | None = None
+
+
+    def _read_video_properties(self, cap, video_path: Path) -> tuple[float, int]:
+        original_fps = cap.get(cv2.CAP_PROP_FPS)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        if original_fps <= 0 or total_frames <= 0:
+            raise ValueError(f"Invalid FPS or frame count in video: {video_path}")
+
+        return original_fps, total_frames
 
     def process_clinical_video(
         self,
@@ -657,13 +679,29 @@ class VideoIngestor:
         if not cap.isOpened():
             raise FileNotFoundError(f"Could not open video: {video_path}")
 
-        original_fps = cap.get(cv2.CAP_PROP_FPS)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-        if original_fps <= 0 or total_frames <= 0:
+        try:
+            original_fps, total_frames = self._read_video_properties(cap, video_path)
+            return self._process_clinical_video_window(
+                cap=cap,
+                original_fps=original_fps,
+                total_frames=total_frames,
+                timestamp_sec=timestamp_sec,
+                record=record,
+                video_filename=video_filename,
+            )
+        finally:
             cap.release()
-            raise ValueError(f"Invalid FPS or frame count in video: {video_path}")
 
+    def _process_clinical_video_window(
+        self,
+        *,
+        cap,
+        original_fps: float,
+        total_frames: int,
+        timestamp_sec: float,
+        record: ClinicalVideoRecord,
+        video_filename: str,
+    ) -> list[dict]:
         video_duration_sec = total_frames / original_fps
         start_sec = max(0.0, timestamp_sec - self.window_sec)
         end_sec = min(video_duration_sec, timestamp_sec + self.window_sec)
@@ -676,14 +714,13 @@ class VideoIngestor:
         sampled_indices = list(range(start_frame, end_frame + 1, step))
 
         if not sampled_indices:
-            cap.release()
             return []
 
         clinical_roi = crop_from_metadata_row(record.__dict__)
         track_store: dict[int, dict] = {}
         frame_cache: dict[int, object] = {}
 
-        # Reset YOLO internal predictor state so tracks do not leak across timestamps.
+        # Importante: mantenemos independencia entre timestamps.
         self.detector.predictor = None
 
         sampled_index_set = set(sampled_indices)
@@ -713,6 +750,9 @@ class VideoIngestor:
                 persist=True,
                 tracker="bytetrack.yaml",
                 conf=self.conf_threshold,
+                device=self.device,
+                half=self.half,
+                imgsz=self.imgsz,
                 verbose=False,
             )
 
@@ -752,17 +792,13 @@ class VideoIngestor:
                 track_store[track_id]["frames"].append(frame_idx)
                 track_store[track_id]["confs"].append(conf)
 
-                existing_metadata = track_store[track_id]["metadata_by_frame"].get(
-                    frame_idx
-                )
+                existing_metadata = track_store[track_id]["metadata_by_frame"].get(frame_idx)
                 if (
                     existing_metadata is None
                     or metadata["detection_confidence"]
                     > existing_metadata["detection_confidence"]
                 ):
                     track_store[track_id]["metadata_by_frame"][frame_idx] = metadata
-
-        cap.release()
 
         primary_track_id = self._select_primary_track(track_store, timestamp_frame)
         sequence_counter = 1
@@ -813,6 +849,72 @@ class VideoIngestor:
             sequence_counter += 1
 
         return saved_frames
+
+    def process_clinical_video_group(
+        self,
+        video_path: str | Path,
+        metadata_df: pd.DataFrame,
+    ) -> list[dict]:
+        if video_path is None:
+            raise ValueError("video_path is None. Video download probably failed.")
+
+        video_path = Path(video_path)
+
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            raise FileNotFoundError(f"Could not open video: {video_path}")
+
+        try:
+            original_fps, total_frames = self._read_video_properties(cap, video_path)
+            new_rows: list[dict] = []
+
+            for row in metadata_df.to_dict(orient="records"):
+                base_row = {
+                    "histology": row["histology"],
+                    "patient_id": row["patient_id"],
+                    "day": row["day"],
+                    "R": row["R"],
+                    "F": row["F"],
+                }
+
+                for column in CROP_COLUMNS:
+                    base_row[column] = row.get(column, 0)
+
+                record = ClinicalVideoRecord(
+                    patient_id=str(row["patient_id"]),
+                    day=str(row["day"]),
+                    hour=str(row["hour"]),
+                    R=str(row["R"]),
+                    F=str(row["F"]),
+                    histology=str(row["histology"]),
+                    filename=str(row["filename"]),
+                    crop_x=row.get("crop_x"),
+                    crop_y=row.get("crop_y"),
+                    crop_w=row.get("crop_w"),
+                    crop_h=row.get("crop_h"),
+                )
+
+                saved_frames = self._process_clinical_video_window(
+                    cap=cap,
+                    original_fps=original_fps,
+                    total_frames=total_frames,
+                    timestamp_sec=float(row["elapsed_seconds"]),
+                    record=record,
+                    video_filename=str(row["video_filename"]),
+                )
+
+                for frame_metadata in saved_frames:
+                    new_rows.append(
+                        {
+                            **base_row,
+                            **frame_metadata,
+                        }
+                    )
+
+            return new_rows
+
+        finally:
+            cap.release()
 
     def _num_candidates_for_histology(self, histology: str) -> int:
         if self.candidates_per_histology is None:
@@ -882,52 +984,16 @@ class VideoIngestor:
 
         output_df = _finalize_phase2_output_columns(output_df)
 
-        new_rows: list[dict] = []
-
-        for row in metadata_df.to_dict(orient="records"):
-            base_row = {
-                "histology": row["histology"],
-                "patient_id": row["patient_id"],
-                "day": row["day"],
-                "R": row["R"],
-                "F": row["F"],
-            }
-            for column in CROP_COLUMNS:
-                base_row[column] = row.get(column, 0)
-
-            record = ClinicalVideoRecord(
-                patient_id=str(row["patient_id"]),
-                day=str(row["day"]),
-                hour=str(row["hour"]),
-                R=str(row["R"]),
-                F=str(row["F"]),
-                histology=str(row["histology"]),
-                filename=str(row["filename"]),
-                crop_x=row.get("crop_x"),
-                crop_y=row.get("crop_y"),
-                crop_w=row.get("crop_w"),
-                crop_h=row.get("crop_h"),
-            )
-
-            saved_frames = self.process_clinical_video(
-                video_path=video_path,
-                timestamp_sec=float(row["elapsed_seconds"]),
-                record=record,
-                video_filename=str(row["video_filename"]),
-            )
-
-            for frame_metadata in saved_frames:
-                new_rows.append(
-                    {
-                        **base_row,
-                        **frame_metadata,
-                    }
-                )
+        new_rows = self.process_clinical_video_group(
+            video_path=video_path,
+            metadata_df=metadata_df,
+        )
 
         if not new_rows:
             return output_df
 
         new_rows_df = pd.DataFrame(new_rows, columns=PHASE2_OUTPUT_COLUMNS)
+
         return _finalize_phase2_output_columns(
             pd.concat([output_df, new_rows_df], ignore_index=True)
         )
@@ -1081,6 +1147,9 @@ class VideoIngestor:
         results = self.detector.predict(
             image,
             conf=self.conf_threshold,
+            device=self.device,
+            half=self.half,
+            imgsz=self.imgsz,
             verbose=False,
         )
 
@@ -1161,16 +1230,28 @@ class VideoIngestor:
     def _copy_original_image(self, filename: str) -> dict[str, float]:
         source_path = self.original_images_dir / filename
         if not source_path.exists():
-            raise FileNotFoundError(f"Could not find original image: {source_path}")
+            raise FileNotFoundError(f"Could not find original cropped image: {source_path}")
 
         destination_path = self.output_dir / filename
+        destination_path.parent.mkdir(parents=True, exist_ok=True)
 
         image = cv2.imread(str(source_path), cv2.IMREAD_COLOR)
         if image is None or image.size == 0:
             raise ValueError(f"Could not read image from path: {source_path}")
 
         detection_metadata = self._get_best_detection_metadata(image)
-        cv2.imwrite(str(destination_path), image)
+
+        if source_path.resolve() != destination_path.resolve():
+            if destination_path.exists():
+                if destination_path.stat().st_size == 0:
+                    destination_path.unlink()
+                else:
+                    return detection_metadata
+
+            try:
+                os.link(source_path, destination_path)
+            except OSError:
+                shutil.copy2(source_path, destination_path)
 
         return detection_metadata
 
@@ -1182,6 +1263,10 @@ def augment_dataset(
     max_candidates_per_video: int = 100,
     target_fps: int = 5,
     window_sec: int = 3,
+    device: str | int = 0,
+    half: bool = True,
+    imgsz: int = 640,
+    max_prefetch_videos: int = 4,
 ) -> dict[str, int | str | bool]:
     metadata_csv_path = Path(metadata_csv_path)
     output_csv_path = Path(output_csv_path)
@@ -1201,6 +1286,8 @@ def augment_dataset(
                 max_candidates_per_video=max_candidates_per_video,
                 target_fps=target_fps,
                 window_sec=window_sec,
+                half=half,
+                imgsz=imgsz,
             ),
             video_states={},
         )
@@ -1233,6 +1320,8 @@ def augment_dataset(
         max_candidates_per_video=max_candidates_per_video,
         target_fps=target_fps,
         window_sec=window_sec,
+        half=half,
+        imgsz=imgsz,
     )
     state, state_is_new, state_changed = _load_or_initialize_phase2_state(
         state_path=state_path,
@@ -1283,6 +1372,9 @@ def augment_dataset(
         target_fps=target_fps,
         window_sec=window_sec,
         max_candidates_per_video=max_candidates_per_video,
+        device=device,
+        half=half,
+        imgsz=imgsz,
     )
     ingestor.candidates_per_histology = ingestor._build_candidates_per_histology(sorted_df)
     ingestor.print_histology_candidate_summary(sorted_df)
@@ -1324,13 +1416,6 @@ def augment_dataset(
 
         try:
             if local_video_path is None:
-                local_video_path = download_video_to_temp(
-                    patient_id=patient_id,
-                    video_name=video_filename,
-                    verbose=False,
-                )
-
-            if local_video_path is None:
                 raise RuntimeError("download failed")
 
             augmented_video_df = ingestor.augment_video_rows(
@@ -1364,6 +1449,29 @@ def augment_dataset(
             _save_phase2_state(state, state_path)
             return False, local_video_path
 
+    def download_video_group(
+        *,
+        video_key: str,
+        patient_id: str,
+        video_filename: str,
+        video_rows_df: pd.DataFrame,
+    ) -> dict:
+        local_video_path = download_video_to_temp(
+            patient_id=patient_id,
+            video_name=video_filename,
+            verbose=False,
+        )
+
+        return {
+            "video_key": video_key,
+            "patient_id": patient_id,
+            "video_filename": video_filename,
+            "video_rows_df": video_rows_df,
+            "local_video_path": local_video_path,
+        }
+
+    prefetch_limit = max(1, int(max_prefetch_videos))
+
     with tqdm(
         total=total_videos,
         initial=_phase2_state_done_count(state),
@@ -1373,28 +1481,77 @@ def augment_dataset(
     ) as progress_bar:
         refresh_progress(progress_bar)
 
-        for video_key, patient_id, video_filename, video_rows_df in work_items:
-            processed, local_video_path = process_video_group(
-                video_key=video_key,
-                patient_id=patient_id,
-                video_filename=video_filename,
-                video_rows_df=video_rows_df,
-            )
-            if processed:
-                videos_processed_first_pass += 1
-            else:
-                failed_groups.append(
-                    {
-                        "video_key": video_key,
-                        "patient_id": patient_id,
-                        "video_filename": video_filename,
-                        "video_rows_df": video_rows_df,
-                        "local_video_path": local_video_path,
-                    }
+        with ThreadPoolExecutor(max_workers=prefetch_limit) as executor:
+            pending_downloads: dict[Future, tuple] = {}
+            work_iter = iter(work_items)
+
+            def schedule_next_download() -> bool:
+                try:
+                    video_key, patient_id, video_filename, video_rows_df = next(work_iter)
+                except StopIteration:
+                    return False
+
+                future = executor.submit(
+                    download_video_group,
+                    video_key=video_key,
+                    patient_id=patient_id,
+                    video_filename=video_filename,
+                    video_rows_df=video_rows_df,
+                )
+                pending_downloads[future] = (
+                    video_key,
+                    patient_id,
+                    video_filename,
+                    video_rows_df,
+                )
+                return True
+
+            for _ in range(prefetch_limit):
+                if not schedule_next_download():
+                    break
+
+            while pending_downloads:
+                done_futures, _ = wait(
+                    pending_downloads.keys(),
+                    return_when=FIRST_COMPLETED,
                 )
 
-            progress_bar.update(1)
-            refresh_progress(progress_bar)
+                for completed_future in done_futures:
+                    pending_downloads.pop(completed_future)
+                    downloaded_group = completed_future.result()
+
+                    # En cuanto se completa una descarga, lanzamos otra para mantener la recámara llena.
+                    schedule_next_download()
+
+                    video_key = downloaded_group["video_key"]
+                    patient_id = downloaded_group["patient_id"]
+                    video_filename = downloaded_group["video_filename"]
+                    video_rows_df = downloaded_group["video_rows_df"]
+                    local_video_path = downloaded_group["local_video_path"]
+
+                    processed, failed_local_video_path = process_video_group(
+                        video_key=video_key,
+                        patient_id=patient_id,
+                        video_filename=video_filename,
+                        video_rows_df=video_rows_df,
+                        local_video_path=local_video_path,
+                    )
+
+                    if processed:
+                        videos_processed_first_pass += 1
+                    else:
+                        failed_groups.append(
+                            {
+                                "video_key": video_key,
+                                "patient_id": patient_id,
+                                "video_filename": video_filename,
+                                "video_rows_df": video_rows_df,
+                                "local_video_path": failed_local_video_path,
+                            }
+                        )
+
+                    progress_bar.update(1)
+                    refresh_progress(progress_bar)
 
     if failed_groups:
         with tqdm(
@@ -1412,15 +1569,25 @@ def augment_dataset(
                 video_rows_df = failed_group["video_rows_df"]
                 local_video_path = failed_group["local_video_path"]
 
-                processed, _ = process_video_group(
+                if local_video_path is None:
+                    local_video_path = download_video_to_temp(
+                        patient_id=patient_id,
+                        video_name=video_filename,
+                        verbose=False,
+                    )
+
+                processed, retry_local_video_path = process_video_group(
                     video_key=video_key,
                     patient_id=patient_id,
                     video_filename=video_filename,
                     video_rows_df=video_rows_df,
                     local_video_path=local_video_path,
                 )
+
                 if processed:
                     videos_recovered_second_pass += 1
+                elif retry_local_video_path is not None:
+                    delete_temp_video(retry_local_video_path, verbose=False)
 
                 retry_bar.update(1)
                 refresh_progress(retry_bar)
