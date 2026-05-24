@@ -2,9 +2,7 @@ from pathlib import Path
 
 import src.ModelTrain as ModelTrain
 
-
 VALIDATION_CSV = Path("validation.csv")
-
 
 # This configuration is used on the baseline model, and fixed for all the experiments in the project. 
 # Doing this we ensure that the evolution of the results is only due to the changes in the data.
