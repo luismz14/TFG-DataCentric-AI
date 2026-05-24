@@ -3,6 +3,11 @@ from pathlib import Path
 import pandas as pd
 
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DATA_DIR = PROJECT_ROOT / "data"
+RESULTS_DIR = PROJECT_ROOT / "results"
+
+
 def ensure_parent_dir(path: str | Path) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -16,6 +21,19 @@ def read_csv(path: str | Path, **kwargs) -> pd.DataFrame:
         raise ValueError(f"`path` must point to a CSV file. Got: {path}")
 
     return pd.read_csv(path, **kwargs)
+
+
+def resolve_data_path(path: str | Path) -> Path:
+    """Resolve paths consistently against the project data directory."""
+    path = Path(path)
+
+    if path.is_absolute():
+        return path
+
+    if path.parts and path.parts[0].lower() == "data":
+        return PROJECT_ROOT / path
+
+    return DATA_DIR / path
 
 
 def write_csv(

@@ -14,6 +14,7 @@ from sklearn.metrics import (
 )
 
 import src.ModelTrain as ModelTrain
+from utils.common import RESULTS_DIR, resolve_data_path
 
 
 def _clone_config(config: ModelTrain.TrainingConfig) -> ModelTrain.TrainingConfig:
@@ -74,11 +75,11 @@ def _build_validation_loader(
     config: ModelTrain.TrainingConfig,
     device: torch.device,
 ):
-    val_metadata_df = ModelTrain.load_metadata(validation_csv_dir)
+    val_metadata_df = ModelTrain.load_training_metadata(validation_csv_dir)
     _, val_transform = ModelTrain.build_transforms(config)
     val_dataset = ModelTrain.PolypDataset(
         val_metadata_df,
-        images_dir=ModelTrain.resolve_data_path(validation_img_dir),
+        images_dir=resolve_data_path(validation_img_dir),
         transform=val_transform,
     )
     return ModelTrain.build_validation_dataloader(val_dataset, config, device)
@@ -91,7 +92,7 @@ def _evaluate_results_dir(
     config: ModelTrain.TrainingConfig,
 ) -> dict[str, float | str]:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    results_path = ModelTrain.RESULTS_DIR / Path(results_dir)
+    results_path = RESULTS_DIR / Path(results_dir)
     weights_path = results_path / "best_baseline_model.pth"
 
     if not results_path.exists():

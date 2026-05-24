@@ -14,6 +14,13 @@ import cv2
 import pandas as pd
 from tqdm import tqdm
 
+from src.phase0.config import CROP_COLUMNS
+from src.phase0.crop import (
+    clamp_crop_to_frame,
+    crop_frame,
+    crop_from_metadata_row,
+    detect_clinical_area,
+)
 from utils.common import read_csv, validate_required_columns, write_csv
 
 
@@ -33,6 +40,10 @@ PHASE2_OUTPUT_COLUMNS = [
     "F",
     "video_filename",
     "elapsed_seconds",
+    "crop_x",
+    "crop_y",
+    "crop_w",
+    "crop_h",
     "source_type",
     "detection_confidence",
     "bbox_area_ratio",
@@ -87,6 +98,10 @@ _PHASE2_COLUMN_DEFAULTS = {
     "F": "",
     "video_filename": "",
     "elapsed_seconds": 0.0,
+    "crop_x": 0,
+    "crop_y": 0,
+    "crop_w": 0,
+    "crop_h": 0,
     "source_type": "original",
     "detection_confidence": 0.0,
     "bbox_area_ratio": 0.0,
@@ -113,6 +128,11 @@ def _finalize_phase2_output_columns(output_df: pd.DataFrame) -> pd.DataFrame:
         output_df["bbox_area_ratio"],
         errors="coerce",
     ).fillna(0.0)
+    for column in CROP_COLUMNS:
+        output_df[column] = pd.to_numeric(
+            output_df[column],
+            errors="coerce",
+        ).fillna(0).astype(int)
 
     return output_df.loc[:, PHASE2_OUTPUT_COLUMNS].reset_index(drop=True)
 
@@ -126,6 +146,10 @@ class ClinicalVideoRecord:
     F: str
     histology: str
     filename: str = ""
+    crop_x: int | None = None
+    crop_y: int | None = None
+    crop_w: int | None = None
+    crop_h: int | None = None
 
 
 def build_histology_candidate_summary(
@@ -299,7 +323,7 @@ def _build_phase2_source_signature(
     """Hash the input rows and relevant config so stale state is not reused."""
     signature_columns = [
         column
-        for column in PHASE2_METADATA_REQUIRED_COLUMNS
+        for column in [*PHASE2_METADATA_REQUIRED_COLUMNS, *CROP_COLUMNS]
         if column in sorted_df.columns
     ]
     signature_df = sorted_df.loc[:, signature_columns].astype(str)
@@ -585,35 +609,12 @@ def _phase2_state_is_complete(state: dict, output_csv_path: Path) -> bool:
     )
 
 
-def detect_clinical_area(
-    frame,
-    threshold: int = 15,
-    padding: int = 10,
-) -> tuple[int, int, int, int]:
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    _, thresh = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY)
-
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    if not contours:
-        return 0, 0, frame.shape[1], frame.shape[0]
-
-    x, y, w, h = cv2.boundingRect(max(contours, key=cv2.contourArea))
-
-    x = max(0, x - padding)
-    y = max(0, y - padding)
-    w = min(frame.shape[1] - x, w + 2 * padding)
-    h = min(frame.shape[0] - y, h + 2 * padding)
-
-    return x, y, w, h
-
-
 class VideoIngestor:
     def __init__(
         self,
         yolo_weights_path: str | Path,
         output_dir: str | Path = "data/phase2/frames",
-        original_images_dir: str | Path = "data/unified_images",
+        original_images_dir: str | Path = "data/images_cropped",
         target_fps: int = 5,
         window_sec: int = 3,
         conf_threshold: float = 0.15,
@@ -678,7 +679,7 @@ class VideoIngestor:
             cap.release()
             return []
 
-        clinical_roi = None
+        clinical_roi = crop_from_metadata_row(record.__dict__)
         track_store: dict[int, dict] = {}
         frame_cache: dict[int, object] = {}
 
@@ -704,6 +705,7 @@ class VideoIngestor:
                 clinical_roi = self._detect_clinical_area(frame)
 
             cropped = self._crop_frame(frame, clinical_roi)
+            clinical_roi = clamp_crop_to_frame(frame, clinical_roi)
             frame_cache[frame_idx] = cropped
 
             results = self.detector.track(
@@ -800,6 +802,10 @@ class VideoIngestor:
                     "filename": save_path.name,
                     "video_filename": video_filename,
                     "elapsed_seconds": timestamp_sec,
+                    "crop_x": clinical_roi[0],
+                    "crop_y": clinical_roi[1],
+                    "crop_w": clinical_roi[2],
+                    "crop_h": clinical_roi[3],
                     "source_type": "video_candidate",
                     **detection_metadata,
                 }
@@ -886,6 +892,9 @@ class VideoIngestor:
                 "R": row["R"],
                 "F": row["F"],
             }
+            for column in CROP_COLUMNS:
+                base_row[column] = row.get(column, 0)
+
             record = ClinicalVideoRecord(
                 patient_id=str(row["patient_id"]),
                 day=str(row["day"]),
@@ -894,6 +903,10 @@ class VideoIngestor:
                 F=str(row["F"]),
                 histology=str(row["histology"]),
                 filename=str(row["filename"]),
+                crop_x=row.get("crop_x"),
+                crop_y=row.get("crop_y"),
+                crop_w=row.get("crop_w"),
+                crop_h=row.get("crop_h"),
             )
 
             saved_frames = self.process_clinical_video(
@@ -977,8 +990,7 @@ class VideoIngestor:
         )
 
     def _crop_frame(self, frame, roi):
-        x, y, w, h = roi
-        return frame[y : y + h, x : x + w]
+        return crop_frame(frame, clamp_crop_to_frame(frame, roi))
 
     def _detect_clinical_area(self, frame):
         return detect_clinical_area(frame)
@@ -1157,10 +1169,8 @@ class VideoIngestor:
         if image is None or image.size == 0:
             raise ValueError(f"Could not read image from path: {source_path}")
 
-        roi = self._detect_clinical_area(image)
-        cropped = self._crop_frame(image, roi)
-        detection_metadata = self._get_best_detection_metadata(cropped)
-        cv2.imwrite(str(destination_path), cropped)
+        detection_metadata = self._get_best_detection_metadata(image)
+        cv2.imwrite(str(destination_path), image)
 
         return detection_metadata
 

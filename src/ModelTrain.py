@@ -23,34 +23,25 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from sklearn.metrics import classification_report, confusion_matrix, f1_score
-from sklearn.model_selection import StratifiedGroupKFold
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torchvision import transforms
 from tqdm import tqdm
 
 from .PolypClassifier import PolypClassifier
-from utils.common import read_csv, validate_required_columns, write_csv
+from utils.common import (
+    RESULTS_DIR,
+    read_csv,
+    resolve_data_path,
+    validate_required_columns,
+)
+from utils.constants import CLASS_NAMES, LABEL_MAP
 
 
 # ---------------------------------------------------------------------------
 # Project constants
 # ---------------------------------------------------------------------------
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = PROJECT_ROOT / "data"
-RESULTS_DIR = PROJECT_ROOT / "results"
-
-CLASS_NAMES = [
-    "Adenoma",
-    "Sessile_serrated_adenoma",
-    "Hyperplastic",
-    "Adenocarcinoma",
-]
-LABEL_MAP = {class_name: idx for idx, class_name in enumerate(CLASS_NAMES)}
-
-GROUP_COLUMNS = ["patient_id", "day", "R", "F"]
-REQUIRED_METADATA_COLUMNS = [*GROUP_COLUMNS, "histology", "filename"]
-
+TRAINING_REQUIRED_COLUMNS = ["histology", "filename"]
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -61,8 +52,6 @@ REQUIRED_METADATA_COLUMNS = [*GROUP_COLUMNS, "histology", "filename"]
 class TrainingConfig:
     """Baseline hyperparameters fixed across the data-centric experiments."""
 
-    # Static split creation only; training receives explicit train/validation CSVs.
-    train_ratio: float = 0.80
     random_state: int = 42
 
     input_size: int = 224
@@ -129,49 +118,6 @@ def set_random_seed(seed: int) -> None:
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-# ---------------------------------------------------------------------------
-# Data preparation
-# ---------------------------------------------------------------------------
-
-
-def resolve_data_path(path: str | Path) -> Path:
-    """Resolve paths consistently against the project data directory."""
-    path = Path(path)
-
-    if path.is_absolute():
-        return path
-
-    if path.parts and path.parts[0].lower() == "data":
-        return PROJECT_ROOT / path
-
-    return DATA_DIR / path
-
-
-def load_metadata(metadata_path: str | Path) -> pd.DataFrame:
-    """Load the training metadata and enforce the expected schema."""
-    metadata_path = resolve_data_path(metadata_path)
-    metadata_df = read_csv(metadata_path)
-    validate_required_columns(
-        metadata_df,
-        REQUIRED_METADATA_COLUMNS,
-        f"metadata file '{metadata_path}'",
-    )
-
-    metadata_df = metadata_df.dropna(
-        subset=[*GROUP_COLUMNS, "histology", "filename"]
-    ).reset_index(drop=True)
-
-    unknown_labels = sorted(set(metadata_df["histology"]) - set(CLASS_NAMES))
-    if unknown_labels:
-        unknown_labels_str = ", ".join(unknown_labels)
-        raise ValueError(
-            "Unexpected histology labels found in metadata: "
-            f"{unknown_labels_str}."
-        )
-
-    return metadata_df
-
-
 def get_class_counts(dataframe: pd.DataFrame) -> pd.Series:
     """Return class counts ordered exactly as `CLASS_NAMES`."""
     return (
@@ -182,76 +128,29 @@ def get_class_counts(dataframe: pd.DataFrame) -> pd.Series:
     )
 
 
-def get_n_splits_from_train_ratio(train_ratio: float) -> int:
-    """Convert a desired train ratio into the closest validation fold count."""
-    val_ratio = 1.0 - train_ratio
-    if not 0.0 < val_ratio < 1.0:
-        raise ValueError(f"train_ratio must be between 0 and 1, got {train_ratio}.")
-
-    return max(2, round(1.0 / val_ratio))
-
-
-def perform_clinical_data_split(
-    metadata_path: str | Path,
-    train_ratio: float = 0.80,
-    random_state: int = 42,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Split metadata with stratified lesion-level groups.
-
-    Multiple images can belong to the same lesion and look almost identical.
-    Grouping by patient, day and lesion identifiers avoids leakage, while
-    stratification keeps the validation class distribution as stable as the
-    group constraints allow.
-    """
-
-    metadata_df = load_metadata(metadata_path).copy()
-    metadata_df["group_id"] = (
-        metadata_df[list(GROUP_COLUMNS)].astype(str).agg("_".join, axis=1)
+def load_training_metadata(metadata_path: str | Path) -> pd.DataFrame:
+    """Load metadata with the schema required by the classifier trainer."""
+    metadata_path = resolve_data_path(metadata_path)
+    metadata_df = read_csv(metadata_path)
+    validate_required_columns(
+        metadata_df,
+        TRAINING_REQUIRED_COLUMNS,
+        f"training metadata file '{metadata_path}'",
     )
 
-    splitter = StratifiedGroupKFold(
-        n_splits=get_n_splits_from_train_ratio(train_ratio),
-        shuffle=True,
-        random_state=random_state,
+    metadata_df = metadata_df.dropna(subset=TRAINING_REQUIRED_COLUMNS).reset_index(
+        drop=True
     )
-    train_indices, val_indices = next(
-        splitter.split(
-            metadata_df["filename"],
-            metadata_df["histology"],
-            groups=metadata_df["group_id"],
+
+    unknown_labels = sorted(set(metadata_df["histology"]) - set(CLASS_NAMES))
+    if unknown_labels:
+        unknown_labels_str = ", ".join(unknown_labels)
+        raise ValueError(
+            "Unexpected histology labels found in training metadata: "
+            f"{unknown_labels_str}."
         )
-    )
 
-    train_df = metadata_df.iloc[train_indices].reset_index(drop=True)
-    val_df = metadata_df.iloc[val_indices].reset_index(drop=True)
-    return train_df, val_df
-
-
-def split_train_validation(
-    source_csv_name: str | Path,
-    train_csv_name: str | Path,
-    validation_csv_name: str | Path,
-    train_ratio: float = 0.80,
-    random_state: int = 42,
-    overwrite: bool = False,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Create or load the fixed train/validation CSVs used by all phases."""
-    train_csv_path = resolve_data_path(train_csv_name)
-    validation_csv_path = resolve_data_path(validation_csv_name)
-
-    if train_csv_path.exists() and validation_csv_path.exists() and not overwrite:
-        train_df = load_metadata(train_csv_path)
-        val_df = load_metadata(validation_csv_path)
-        return train_df, val_df
-
-    train_df, val_df = perform_clinical_data_split(
-        source_csv_name,
-        train_ratio=train_ratio,
-        random_state=random_state,
-    )
-    write_csv(train_df, train_csv_path)
-    write_csv(val_df, validation_csv_path)
-    return train_df, val_df
+    return metadata_df
 
 
 class PolypDataset(Dataset):
@@ -727,8 +626,8 @@ def train(
     experiment_dir = RESULTS_DIR / Path(save_dir)
     experiment_dir.mkdir(parents=True, exist_ok=True)
 
-    train_metadata_df = load_metadata(train_metadata_path)
-    val_metadata_df = load_metadata(validation_metadata_path)
+    train_metadata_df = load_training_metadata(train_metadata_path)
+    val_metadata_df = load_training_metadata(validation_metadata_path)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Hardware assigned for tensor computations: {device}")
