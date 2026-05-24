@@ -298,6 +298,7 @@ def build_dataloaders(
     }
     if config.num_workers > 0:
         dataloader_kwargs["persistent_workers"] = True
+        dataloader_kwargs["prefetch_factor"] = 2
 
     train_loader = DataLoader(
         train_dataset,
@@ -321,6 +322,7 @@ def build_validation_dataloader(
     }
     if config.num_workers > 0:
         dataloader_kwargs["persistent_workers"] = True
+        dataloader_kwargs["prefetch_factor"] = 2
 
     return DataLoader(
         val_dataset,
@@ -630,17 +632,6 @@ def train(
     val_metadata_df = load_training_metadata(validation_metadata_path)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Hardware assigned for tensor computations: {device}")
-    print(f"Training metadata: {train_metadata_path}")
-    print(f"Validation metadata: {validation_metadata_path}")
-
-    train_class_counts = get_class_counts(train_metadata_df)
-    val_class_counts = get_class_counts(val_metadata_df)
-    print("Train class distribution:")
-    print(train_class_counts.to_string())
-    print()
-    print("Validation class distribution:")
-    print(val_class_counts.to_string())
 
     train_dataset, val_dataset = build_datasets(
         train_metadata_df,
@@ -800,7 +791,6 @@ def train(
             epoch + 1 > config.warmup_epochs
             and epochs_without_improvement >= config.early_stopping_patience
         ):
-            print()
             print(
                 "Early stopping triggered after "
                 f"{config.early_stopping_patience} epochs without improving "
@@ -831,9 +821,8 @@ def train(
     torch.save(model.state_dict(), best_model_weights_path)
     shutil.rmtree(checkpoint_dir, ignore_errors=True)
 
-    print()
     print(
-        "Optimization sequence completed. "
+        f"Optimization sequence completed with seed {config.random_state}. "
         f"Selected checkpoint macro-F1: {best_checkpoint.macro_f1:.4f} "
         f"with validation loss {best_checkpoint.val_loss:.4f} "
         f"and validation score {best_checkpoint.validation_score:.4f} "
