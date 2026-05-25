@@ -13,6 +13,10 @@ VIDEO_FILENAME_RE = re.compile(
     r"^(?P<day>\d{8})_(?P<hour>\d{6})_(?P<R>R\d+)_(?P<uid>[^.]+)\.(?P<ext>mp4|avi|mov)$",
     re.IGNORECASE,
 )
+IMAGE_FILENAME_RE = re.compile(
+    r"^(?P<day>\d{8})_(?P<hour>\d{6})_(?P<R>R\d+)_(?P<F>F\d+)_(?P<S>S\d+)_(?P<uid>[^.]+)\.(?P<ext>jpg|jpeg|png)$",
+    re.IGNORECASE,
+)
 
 
 def parse_video_filename(filename: str) -> dict[str, str] | None:
@@ -24,8 +28,31 @@ def parse_video_filename(filename: str) -> dict[str, str] | None:
     return {
         "day": parts["day"],
         "hour": parts["hour"],
+        "R": parts["R"],
+        "uid": parts["uid"],
         "video_filename": filename,
     }
+
+
+def parse_image_filename(filename: str) -> dict[str, str] | None:
+    match = IMAGE_FILENAME_RE.match(filename)
+    if match is None:
+        return None
+
+    parts = match.groupdict()
+    return {
+        "day": parts["day"],
+        "hour": parts["hour"],
+        "R": parts["R"],
+        "uid": parts["uid"],
+    }
+
+
+def _image_uid_from_filename(filename: str) -> str:
+    parsed_image = parse_image_filename(str(filename))
+    if parsed_image is None:
+        return ""
+    return parsed_image["uid"]
 
 
 def load_videos(inventory_path: str | Path) -> pd.DataFrame:
@@ -52,7 +79,15 @@ def load_videos(inventory_path: str | Path) -> pd.DataFrame:
 
     if not records:
         return pd.DataFrame(
-            columns=["patient_id", "day", "hour", "video_filename", "video_timestamp"]
+            columns=[
+                "patient_id",
+                "day",
+                "hour",
+                "R",
+                "uid",
+                "video_filename",
+                "video_timestamp",
+            ]
         )
 
     videos_df = pd.DataFrame(records, dtype=str)
@@ -61,29 +96,47 @@ def load_videos(inventory_path: str | Path) -> pd.DataFrame:
         format="%Y%m%d%H%M%S",
     )
 
-    return videos_df.sort_values(["patient_id", "video_timestamp", "video_filename"]).reset_index(
-        drop=True
-    )
+    return videos_df.sort_values(
+        ["patient_id", "day", "R", "uid", "video_timestamp", "video_filename"]
+    ).reset_index(drop=True)
 
 
 def match_videos_to_images(baseline_df: pd.DataFrame, videos_df: pd.DataFrame) -> pd.DataFrame:
     matched_groups: list[pd.DataFrame] = []
+    required_image_columns = {"patient_id", "day", "R", "filename", "image_timestamp", "row_id"}
+    missing_image_columns = required_image_columns.difference(baseline_df.columns)
+    if missing_image_columns:
+        missing = ", ".join(sorted(missing_image_columns))
+        raise ValueError(f"baseline_df is missing required columns for video matching: {missing}")
 
-    for patient_id, image_group_df in baseline_df.groupby("patient_id", sort=False):
+    image_df = baseline_df.copy()
+    image_df["match_uid"] = image_df["filename"].map(_image_uid_from_filename)
+
+    for (patient_id, day, region, uid), image_group_df in image_df.groupby(
+        ["patient_id", "day", "R", "match_uid"],
+        sort=False,
+    ):
         image_group_df = image_group_df.sort_values(["image_timestamp", "row_id"]).copy()
-        patient_videos_df = videos_df.loc[videos_df["patient_id"] == patient_id].copy()
+        matching_videos_df = videos_df.loc[
+            videos_df["patient_id"].astype(str).eq(str(patient_id))
+            & videos_df["day"].astype(str).eq(str(day))
+            & videos_df["R"].astype(str).eq(str(region))
+            & videos_df["uid"].astype(str).eq(str(uid))
+        ].copy()
 
-        if patient_videos_df.empty:
+        if matching_videos_df.empty:
             image_group_df["video_filename"] = ""
             image_group_df["video_timestamp"] = pd.NaT
             matched_groups.append(image_group_df)
             continue
 
-        patient_videos_df = patient_videos_df.sort_values(["video_timestamp", "video_filename"])
+        matching_videos_df = matching_videos_df.sort_values(
+            ["video_timestamp", "video_filename"]
+        )
 
         matched_group_df = pd.merge_asof(
             image_group_df,
-            patient_videos_df[["video_timestamp", "video_filename"]],
+            matching_videos_df[["video_timestamp", "video_filename"]],
             left_on="image_timestamp",
             right_on="video_timestamp",
             direction="backward",
@@ -94,7 +147,12 @@ def match_videos_to_images(baseline_df: pd.DataFrame, videos_df: pd.DataFrame) -
     if not matched_groups:
         return baseline_df.copy()
 
-    return pd.concat(matched_groups, ignore_index=True).sort_values("row_id").reset_index(drop=True)
+    return (
+        pd.concat(matched_groups, ignore_index=True)
+        .drop(columns=["match_uid"], errors="ignore")
+        .sort_values("row_id")
+        .reset_index(drop=True)
+    )
 
 
 def generate_phase2_baseline_with_video(

@@ -18,4 +18,8 @@ PHASE2_MAX_PREFETCH_VIDEOS = 4
 
 PHASE2_RUNS = [
     {"results_dir": Path("phase2/seed_1"), "random_state": 42},
+    {"results_dir": Path("phase2/seed_2"), "random_state": 123},
+    {"results_dir": Path("phase2/seed_3"), "random_state": 456},
+    {"results_dir": Path("phase2/seed_4"), "random_state": 789},
+
 ]

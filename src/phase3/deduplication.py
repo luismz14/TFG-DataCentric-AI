@@ -30,9 +30,11 @@ def run_phase3_deduplication(
     input_csv: str | Path = PHASE3_SOURCE_CSV,
     ssim_threshold: float = 0.75,
     phash_distance_threshold: int = 8,
+    output_csv: str | Path | None = None,
+    descriptor: str | None = None,
 ) -> dict[str, object]:
-    descriptor = deduplication_tag(ssim_threshold, phash_distance_threshold)
-    output_csv = phase3_csv_path(PHASE3_DATA_DIR, descriptor)
+    descriptor = descriptor or deduplication_tag(ssim_threshold, phash_distance_threshold)
+    output_csv = output_csv or phase3_csv_path(PHASE3_DATA_DIR, descriptor)
     output_csv_path = resolve_data_path(output_csv)
 
     metrics_df = calculate_phase3_metrics(

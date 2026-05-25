@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from collections.abc import Mapping
 
 import src.Filters as Filter
 
@@ -15,7 +16,7 @@ def format_threshold(value: float | int) -> str:
 
 def deduplication_tag(ssim_threshold: float, phash_distance_threshold: int) -> str:
     return (
-        f"deduplicated_ssim{format_threshold(ssim_threshold)}"
+        f"deduplication_ssim{format_threshold(ssim_threshold)}"
         f"_phash{format_threshold(phash_distance_threshold)}"
     )
 
@@ -58,3 +59,37 @@ def filtered_descriptor(
         return f"{input_descriptor}_filtered_{filters_descriptor}"
 
     return f"filtered_{filters_descriptor}"
+
+
+def normalize_phase3_steps(steps: Mapping[str, bool]) -> dict[str, bool]:
+    expected_steps = ("deduplication", "darkness", "uniformity", "blur")
+    unknown_steps = sorted(set(steps) - set(expected_steps))
+    if unknown_steps:
+        raise ValueError(f"Unknown phase 3 steps: {', '.join(unknown_steps)}")
+    return {step: bool(steps.get(step, False)) for step in expected_steps}
+
+
+def descriptor_from_steps(
+    steps: Mapping[str, bool],
+    params: Filter.FilterParams,
+    ssim_threshold: float,
+    phash_distance_threshold: int,
+) -> str:
+    resolved_steps = normalize_phase3_steps(steps)
+    parts = []
+
+    if resolved_steps["deduplication"]:
+        parts.append(deduplication_tag(ssim_threshold, phash_distance_threshold))
+
+    enabled_filters = tuple(
+        filter_name
+        for filter_name in ("darkness", "uniformity", "blur")
+        if resolved_steps[filter_name]
+    )
+    if enabled_filters:
+        parts.append(filter_tag(enabled_filters, params))
+
+    if not parts:
+        return "no_processing"
+
+    return "_".join(parts)

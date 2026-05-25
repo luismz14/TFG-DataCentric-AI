@@ -12,6 +12,7 @@ from src.phase3.deduplication import (
     print_phase3_dataset_summary,
     run_phase3_deduplication,
 )
+from src.phase3.handler import run_phase3_processing
 from src.phase3.naming import descriptor_from_csv
 from src.phase3.quality import run_phase3_quality_filters
 from utils.common import DATA_DIR
@@ -40,9 +41,10 @@ def _runs_for_descriptor(descriptor: str) -> list[dict]:
 def train_phase3_dataset(
     train_csv: str | Path,
     force_train: bool = False,
+    descriptor: str | None = None,
 ) -> str:
     train_csv = _csv_relative_to_data(train_csv)
-    descriptor = descriptor_from_csv(train_csv)
+    descriptor = descriptor or descriptor_from_csv(train_csv)
     run_training_experiments(
         runs=_runs_for_descriptor(descriptor),
         train_csv=train_csv,
@@ -53,14 +55,14 @@ def train_phase3_dataset(
     return descriptor
 
 
-def show_phase3_plots(train_csv: str | Path) -> None:
-    descriptor = descriptor_from_csv(train_csv)
+def show_phase3_plots(train_csv: str | Path, descriptor: str | None = None) -> None:
+    descriptor = descriptor or descriptor_from_csv(train_csv)
     for run in _runs_for_descriptor(descriptor):
         show_training_plots(run["results_dir"])
 
 
-def print_phase3_summary(train_csv: str | Path) -> None:
-    descriptor = descriptor_from_csv(train_csv)
+def print_phase3_summary(train_csv: str | Path, descriptor: str | None = None) -> None:
+    descriptor = descriptor or descriptor_from_csv(train_csv)
     print_experiment_summary(
         results_dirs=[run["results_dir"] for run in _runs_for_descriptor(descriptor)],
         training_config=BASELINE_CONFIG,
@@ -71,6 +73,7 @@ def print_phase3_summary(train_csv: str | Path) -> None:
 __all__ = [
     "PHASE3_SOURCE_CSV",
     "print_phase3_dataset_summary",
+    "run_phase3_processing",
     "run_phase3_deduplication",
     "run_phase3_quality_filters",
     "train_phase3_dataset",

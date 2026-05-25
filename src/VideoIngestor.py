@@ -16,14 +16,14 @@ import cv2
 import pandas as pd
 from tqdm import tqdm
 
-from src.phase0.config import CROP_COLUMNS
+from src.phase0.config import CROP_COLUMNS, SOURCE_IMAGES_DIR
 from src.phase0.crop import (
     clamp_crop_to_frame,
     crop_frame,
     crop_from_metadata_row,
     detect_clinical_area,
 )
-from utils.common import read_csv, validate_required_columns, write_csv
+from utils.common import read_csv, resolve_data_path, validate_required_columns, write_csv
 from utils.constants import BASE_METADATA_COLUMNS, CLASS_NAMES
 
 
@@ -60,6 +60,7 @@ PHASE2_OUTPUT_COLUMNS = [
     *PHASE2_BASE_METADATA_REQUIRED_COLUMNS,
     *PHASE2_OUTPUT_EXTRA_COLUMNS,
 ]
+SOURCE_DIMENSION_COLUMNS = ["source_width", "source_height"]
 
 PHASE2_STATE_VERSION = 1
 PHASE2_VIDEO_STATE_PENDING = "pending"
@@ -124,6 +125,8 @@ class ClinicalVideoRecord:
     crop_y: int | None = None
     crop_w: int | None = None
     crop_h: int | None = None
+    source_width: int | None = None
+    source_height: int | None = None
 
 
 def build_histology_candidate_summary(
@@ -180,6 +183,47 @@ def clean_histology_metadata_rows(
     return cleaned_df.reset_index(drop=True)
 
 
+def _read_image_size(image_path: Path) -> tuple[int, int] | None:
+    image = cv2.imread(str(image_path))
+    if image is None or image.size == 0:
+        return None
+
+    height, width = image.shape[:2]
+    return int(width), int(height)
+
+
+def _add_source_image_dimensions(
+    metadata_df: pd.DataFrame,
+    source_images_dir: str | Path = SOURCE_IMAGES_DIR,
+) -> pd.DataFrame:
+    output_df = metadata_df.copy()
+    if all(column in output_df.columns for column in SOURCE_DIMENSION_COLUMNS):
+        return output_df
+
+    source_images_path = resolve_data_path(source_images_dir)
+    dimensions_by_filename: dict[str, tuple[int, int] | None] = {}
+
+    for filename in output_df["filename"].astype(str).drop_duplicates():
+        dimensions_by_filename[filename] = _read_image_size(source_images_path / filename)
+
+    output_df["source_width"] = output_df["filename"].astype(str).map(
+        lambda filename: (
+            dimensions_by_filename.get(filename)[0]
+            if dimensions_by_filename.get(filename) is not None
+            else 0
+        )
+    )
+    output_df["source_height"] = output_df["filename"].astype(str).map(
+        lambda filename: (
+            dimensions_by_filename.get(filename)[1]
+            if dimensions_by_filename.get(filename) is not None
+            else 0
+        )
+    )
+
+    return output_df
+
+
 def _load_phase2_metadata(
     metadata_csv_path: Path,
     dataset_inventory_path: str | Path,
@@ -195,6 +239,7 @@ def _load_phase2_metadata(
         PHASE2_BASE_METADATA_REQUIRED_COLUMNS,
         f"phase2 metadata '{metadata_csv_path}'",
     )
+    metadata_df = _add_source_image_dimensions(metadata_df)
 
     if all(column in metadata_df.columns for column in PHASE2_METADATA_REQUIRED_COLUMNS):
         return metadata_df
@@ -214,12 +259,11 @@ def _load_phase2_metadata(
         videos_df=videos_df,
     )
 
-    missing_video_mask = enriched_df["video_filename"].astype(str).str.strip().eq("")
-    if missing_video_mask.any():
-        raise ValueError("Some phase2 rows could not be matched to a source video.")
-
-    enriched_df["elapsed_seconds"] = (
-        enriched_df["image_timestamp"] - enriched_df["video_timestamp"]
+    matched_video_mask = enriched_df["video_filename"].astype(str).str.strip().ne("")
+    enriched_df["elapsed_seconds"] = ""
+    enriched_df.loc[matched_video_mask, "elapsed_seconds"] = (
+        enriched_df.loc[matched_video_mask, "image_timestamp"]
+        - enriched_df.loc[matched_video_mask, "video_timestamp"]
     ).dt.total_seconds().astype(int).astype(str)
 
     return enriched_df.drop(
@@ -596,6 +640,7 @@ class VideoIngestor:
         yolo_weights_path: str | Path,
         output_dir: str | Path = "data/phase2/frames",
         original_images_dir: str | Path = "data/images_cropped",
+        source_images_dir: str | Path = SOURCE_IMAGES_DIR,
         target_fps: int = 5,
         window_sec: int = 3,
         conf_threshold: float = 0.15,
@@ -614,6 +659,7 @@ class VideoIngestor:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.original_images_dir = Path(original_images_dir)
+        self.source_images_dir = Path(source_images_dir)
 
         self.target_fps = target_fps
         self.window_sec = window_sec
@@ -678,6 +724,9 @@ class VideoIngestor:
         video_filename: str,
     ) -> list[dict]:
         video_duration_sec = total_frames / original_fps
+        if timestamp_sec < 0 or timestamp_sec > video_duration_sec:
+            return []
+
         start_sec = max(0.0, timestamp_sec - self.window_sec)
         end_sec = min(video_duration_sec, timestamp_sec + self.window_sec)
 
@@ -691,7 +740,8 @@ class VideoIngestor:
         if not sampled_indices:
             return []
 
-        clinical_roi = crop_from_metadata_row(record.__dict__)
+        source_roi = crop_from_metadata_row(record.__dict__)
+        detected_video_roi: tuple[int, int, int, int] | None = None
         track_store: dict[int, dict] = {}
         frame_cache: dict[int, object] = {}
 
@@ -713,11 +763,15 @@ class VideoIngestor:
             if not ret:
                 continue
 
-            if clinical_roi is None:
-                clinical_roi = self._detect_clinical_area(frame)
+            if source_roi is None:
+                if detected_video_roi is None:
+                    detected_video_roi = self._detect_clinical_area(frame)
+                video_roi = detected_video_roi
+            else:
+                video_roi = self._scale_roi_to_frame(frame, source_roi, record)
 
-            cropped = self._crop_frame(frame, clinical_roi)
-            clinical_roi = clamp_crop_to_frame(frame, clinical_roi)
+            cropped = self._crop_frame(frame, video_roi)
+            cropped = self._resize_video_crop_to_source_crop(cropped, source_roi)
             frame_cache[frame_idx] = cropped
 
             results = self.detector.track(
@@ -813,10 +867,10 @@ class VideoIngestor:
                     "filename": save_path.name,
                     "video_filename": video_filename,
                     "elapsed_seconds": timestamp_sec,
-                    "crop_x": clinical_roi[0],
-                    "crop_y": clinical_roi[1],
-                    "crop_w": clinical_roi[2],
-                    "crop_h": clinical_roi[3],
+                    "crop_x": source_roi[0] if source_roi is not None else video_roi[0],
+                    "crop_y": source_roi[1] if source_roi is not None else video_roi[1],
+                    "crop_w": source_roi[2] if source_roi is not None else video_roi[2],
+                    "crop_h": source_roi[3] if source_roi is not None else video_roi[3],
                     "source_type": "video_candidate",
                     **detection_metadata,
                 }
@@ -867,6 +921,8 @@ class VideoIngestor:
                     crop_y=row.get("crop_y"),
                     crop_w=row.get("crop_w"),
                     crop_h=row.get("crop_h"),
+                    source_width=row.get("source_width"),
+                    source_height=row.get("source_height"),
                 )
 
                 saved_frames = self._process_clinical_video_window(
@@ -930,6 +986,10 @@ class VideoIngestor:
         metadata_df = clean_histology_metadata_rows(metadata_df, verbose=False)
         if metadata_df.empty:
             return _finalize_phase2_output_columns(metadata_df)
+        metadata_df = _add_source_image_dimensions(
+            metadata_df,
+            source_images_dir=self.source_images_dir,
+        )
 
         metadata_df["elapsed_seconds"] = pd.to_numeric(
             metadata_df["elapsed_seconds"],
@@ -1032,6 +1092,72 @@ class VideoIngestor:
 
     def _crop_frame(self, frame, roi):
         return crop_frame(frame, clamp_crop_to_frame(frame, roi))
+
+    def _source_image_size(self, filename: str) -> tuple[int, int] | None:
+        return _read_image_size(resolve_data_path(self.source_images_dir) / filename)
+
+    def _record_source_size(self, record: ClinicalVideoRecord) -> tuple[int, int] | None:
+        try:
+            width = int(float(record.source_width)) if record.source_width is not None else 0
+            height = int(float(record.source_height)) if record.source_height is not None else 0
+        except (TypeError, ValueError):
+            width, height = 0, 0
+
+        if width > 0 and height > 0:
+            return width, height
+
+        if record.filename:
+            return self._source_image_size(record.filename)
+
+        return None
+
+    def _scale_roi_to_frame(
+        self,
+        frame,
+        roi: tuple[int, int, int, int],
+        record: ClinicalVideoRecord,
+    ) -> tuple[int, int, int, int]:
+        source_size = self._record_source_size(record)
+        if source_size is None:
+            return clamp_crop_to_frame(frame, roi)
+
+        source_width, source_height = source_size
+        frame_height, frame_width = frame.shape[:2]
+        if source_width <= 0 or source_height <= 0:
+            return clamp_crop_to_frame(frame, roi)
+
+        scale_x = frame_width / source_width
+        scale_y = frame_height / source_height
+        x, y, w, h = roi
+        scaled_roi = (
+            int(round(x * scale_x)),
+            int(round(y * scale_y)),
+            int(round(w * scale_x)),
+            int(round(h * scale_y)),
+        )
+        return clamp_crop_to_frame(frame, scaled_roi)
+
+    def _resize_video_crop_to_source_crop(
+        self,
+        cropped,
+        source_roi: tuple[int, int, int, int] | None,
+    ):
+        if source_roi is None:
+            return cropped
+
+        _, _, target_width, target_height = source_roi
+        if target_width <= 0 or target_height <= 0:
+            return cropped
+
+        height, width = cropped.shape[:2]
+        if width == target_width and height == target_height:
+            return cropped
+
+        return cv2.resize(
+            cropped,
+            (int(target_width), int(target_height)),
+            interpolation=cv2.INTER_AREA,
+        )
 
     def _detect_clinical_area(self, frame):
         return detect_clinical_area(frame)
@@ -1284,10 +1410,13 @@ def augment_dataset(
     sorted_df = metadata_df.sort_values(
         ["patient_id", "video_filename", "elapsed_seconds", "filename"]
     ).reset_index(drop=True)
+    augmentable_df = sorted_df.loc[
+        sorted_df["video_filename"].astype(str).str.strip().ne("")
+    ].reset_index(drop=True)
 
     # One resumable unit is one source video. Each group can contain several
     # annotated timestamps from the same patient/video pair.
-    grouped_items = list(sorted_df.groupby(["patient_id", "video_filename"], sort=False))
+    grouped_items = list(augmentable_df.groupby(["patient_id", "video_filename"], sort=False))
     total_videos = len(grouped_items)
     video_states = _build_phase2_video_states(grouped_items)
     source_signature = _build_phase2_source_signature(
