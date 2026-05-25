@@ -13,7 +13,7 @@ from utils.common import validate_required_columns
 QUALITY_FILTER_SPECS = {
     "darkness": {
         "metric_column": "brightness_v_mean",
-        "thresholds": [45.0, 50.0, 55.0, 60.0, 65.0],
+        "thresholds": [30.0, 35.0, 40.0, 45.0, 50.0],
         "metric_builder": Filter.add_darkness_values,
     },
     "uniformity": {
@@ -27,6 +27,32 @@ QUALITY_FILTER_SPECS = {
         "metric_builder": Filter.add_blur_values,
     },
 }
+
+
+def coerce_review_numeric_series(series: pd.Series) -> pd.Series:
+    def normalize_value(value: object) -> object:
+        if not isinstance(value, str):
+            return value
+
+        value = value.strip()
+        if not value:
+            return value
+
+        if "," in value and "." in value:
+            if value.rfind(",") > value.rfind("."):
+                return value.replace(".", "").replace(",", ".")
+            return value.replace(",", "")
+
+        if "," in value:
+            return value.replace(",", ".")
+
+        if value.count(".") > 1:
+            first_dot = value.find(".")
+            return value[: first_dot + 1] + value[first_dot + 1 :].replace(".", "")
+
+        return value
+
+    return pd.to_numeric(series.map(normalize_value), errors="coerce")
 
 
 def get_quality_filter_spec(filter_name: str) -> dict:
@@ -52,7 +78,7 @@ def ensure_quality_metric(
 
     df = dataframe.copy()
     if metric_column in df.columns:
-        metric_values = pd.to_numeric(df[metric_column], errors="coerce")
+        metric_values = coerce_review_numeric_series(df[metric_column])
         if not metric_values.isna().any():
             df[metric_column] = metric_values
             return df.reset_index(drop=True)
@@ -80,7 +106,7 @@ def sample_images_for_quality_threshold_review(
         raise ValueError("n_per_threshold must be >= 1")
 
     df = dataframe.copy()
-    df[metric_column] = pd.to_numeric(df[metric_column], errors="coerce")
+    df[metric_column] = coerce_review_numeric_series(df[metric_column])
     df = df.dropna(subset=["filename", metric_column]).reset_index(drop=True)
 
     sampled_parts = []
@@ -207,7 +233,7 @@ def evaluate_quality_thresholds_against_manual_labels(
     )
 
     df = labeled_df.copy()
-    df[metric_column] = pd.to_numeric(df[metric_column], errors="coerce")
+    df[metric_column] = coerce_review_numeric_series(df[metric_column])
     df["manual_label"] = df["manual_label"].astype(str).str.strip().str.lower()
 
     valid_labels = set(positive_labels) | set(negative_labels)

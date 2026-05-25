@@ -71,10 +71,13 @@ def run_deduplication_pipeline(
         phash_distance_threshold=phash_distance_threshold,
     )
 
+    comparable_grouped_df = grouped_df[~grouped_df["skip_deduplication"]].copy()
+    passthrough_df = grouped_df[grouped_df["skip_deduplication"]].copy()
+
     # 5. Group redundant pairs into redundancy groups
     # If a -> b and b -> c, then a, b, c are in the same group, even if a !-> c.
     redundancy_grouped_df = group_similar_pairs(
-        dataframe=grouped_df,
+        dataframe=comparable_grouped_df,
         similarity_pairs_df=similarity_pairs_df,
     )
 
@@ -87,6 +90,12 @@ def run_deduplication_pipeline(
     selected_df = select_top_k_per_redundancy_group(
         dataframe=scored_df,
         top_k_by_histology=top_k_by_histology,
+    )
+    passthrough_selected_df = _prepare_passthrough_selection(passthrough_df)
+    selected_df = pd.concat(
+        [selected_df, passthrough_selected_df],
+        ignore_index=True,
+        sort=False,
     )
 
     # 8. Prepare final outputs
@@ -175,7 +184,15 @@ def add_temporal_groups(
         raise ValueError("temporal_tolerance_seconds must be >= 0")
 
     df = dataframe.copy()
+    df["_source_row_order"] = range(len(df))
     df["elapsed_seconds"] = pd.to_numeric(df["elapsed_seconds"], errors="raise")
+    df["skip_deduplication"] = _missing_video_filename_mask(df["video_filename"])
+    df["base_group_id"] = ""
+    df["temporal_event_id"] = -1
+    df["group_id"] = ""
+
+    comparable_df = df[~df["skip_deduplication"]].copy()
+    passthrough_df = df[df["skip_deduplication"]].copy()
 
     base_group_columns = [
         "patient_id",
@@ -186,20 +203,23 @@ def add_temporal_groups(
         "histology",
     ]
 
-    df["base_group_id"] = df[base_group_columns].astype(str).agg("_".join, axis=1)
-    df["temporal_event_id"] = -1
+    comparable_df["base_group_id"] = (
+        comparable_df[base_group_columns].astype(str).agg("_".join, axis=1)
+    )
 
-    df = df.sort_values(
+    comparable_df = comparable_df.sort_values(
         base_group_columns + ["elapsed_seconds", "filename"],
         kind="mergesort",
     ).reset_index(drop=True)
 
-    for _, group_indices in df.groupby("base_group_id", sort=False).groups.items():
+    for _, group_indices in comparable_df.groupby(
+        "base_group_id", sort=False
+    ).groups.items():
         current_event_id = 0
         current_event_start_time = None
 
         for idx in group_indices:
-            current_time = float(df.at[idx, "elapsed_seconds"])
+            current_time = float(comparable_df.at[idx, "elapsed_seconds"])
 
             if current_event_start_time is None:
                 current_event_start_time = current_time
@@ -207,12 +227,24 @@ def add_temporal_groups(
                 current_event_id += 1
                 current_event_start_time = current_time
 
-            df.at[idx, "temporal_event_id"] = current_event_id
+            comparable_df.at[idx, "temporal_event_id"] = current_event_id
 
-    df["temporal_event_id"] = df["temporal_event_id"].astype(int)
-    df["group_id"] = df["base_group_id"] + "_T" + df["temporal_event_id"].astype(str)
+    comparable_df["temporal_event_id"] = comparable_df["temporal_event_id"].astype(int)
+    comparable_df["group_id"] = (
+        comparable_df["base_group_id"]
+        + "_T"
+        + comparable_df["temporal_event_id"].astype(str)
+    )
 
-    return df
+    grouped_df = pd.concat(
+        [comparable_df, passthrough_df],
+        ignore_index=True,
+        sort=False,
+    )
+    grouped_df = grouped_df.sort_values("_source_row_order", kind="mergesort")
+    grouped_df = grouped_df.drop(columns=["_source_row_order"]).reset_index(drop=True)
+
+    return grouped_df
 
 
 def build_similarity_view(
@@ -431,9 +463,17 @@ def calculate_similarity(
 
     validate_required_columns(dataframe, required_columns, "similarity")
 
+    comparable_df = dataframe.copy()
+    if "skip_deduplication" in comparable_df.columns:
+        comparable_df = comparable_df[~comparable_df["skip_deduplication"]].copy()
+
+    comparable_df = comparable_df[
+        comparable_df["group_id"].astype(str).str.strip() != ""
+    ].copy()
+
     pairwise_results = []
 
-    for _, group_df in dataframe.groupby("group_id", sort=False):
+    for _, group_df in comparable_df.groupby("group_id", sort=False):
         if len(group_df) < 2:
             continue
 
@@ -808,18 +848,55 @@ def _create_summary(
         redundant_pairs = int(similarity_pairs_df["is_redundant"].sum())
 
     removed_images = len(selected_df) - len(final_df)
+    passthrough_images = int(grouped_df["skip_deduplication"].sum())
+    comparable_grouped_df = grouped_df[~grouped_df["skip_deduplication"]]
+    comparable_selected_df = selected_df[~selected_df["skip_deduplication"]]
 
     return {
         "metadata_path": str(metadata_path),
         "images_dir": str(images_dir),
         "input_images": len(input_df),
-        "temporal_groups": int(grouped_df["group_id"].nunique()),
+        "temporal_groups": int(comparable_grouped_df["group_id"].nunique()),
+        "passthrough_images": passthrough_images,
         "comparable_pairs": len(similarity_pairs_df),
         "redundant_pairs": redundant_pairs,
-        "redundancy_groups": int(selected_df["redundancy_group_id"].nunique()),
+        "redundancy_groups": int(
+            comparable_selected_df["redundancy_group_id"].nunique()
+        ),
         "kept_images": len(final_df),
         "removed_images": removed_images,
     }
+
+
+def _missing_video_filename_mask(series: pd.Series) -> pd.Series:
+    return series.isna() | series.astype(str).str.strip().eq("")
+
+
+def _prepare_passthrough_selection(dataframe: pd.DataFrame) -> pd.DataFrame:
+    df = dataframe.copy()
+
+    if df.empty:
+        return df
+
+    df["redundancy_group_id"] = ""
+    df["redundancy_group_index"] = -1
+    df["redundancy_group_size"] = 1
+    df["is_singleton_redundancy_group"] = True
+
+    for column in [
+        "norm_laplacian_variance",
+        "norm_bbox_area_ratio",
+        "norm_detection_confidence",
+        "quality_score",
+    ]:
+        df[column] = 0.0
+
+    df["top_k"] = 1
+    df["quality_rank_in_redundancy_group"] = 1
+    df["selected"] = True
+    df["discard_reason"] = "selected_no_video"
+
+    return df
 
 
 def _find_root(parent: dict[str, str], item: str) -> str:
