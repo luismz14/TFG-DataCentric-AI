@@ -16,6 +16,9 @@ from sklearn.metrics import (
 import src.ModelTrain as ModelTrain
 from utils.common import RESULTS_DIR, resolve_data_path
 
+import warnings
+warnings.filterwarnings("ignore", message=".*torch.load.*weights_only=False.*")
+
 
 def _clone_config(config: ModelTrain.TrainingConfig) -> ModelTrain.TrainingConfig:
     return ModelTrain.TrainingConfig(

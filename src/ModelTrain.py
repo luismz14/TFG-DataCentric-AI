@@ -36,6 +36,8 @@ from utils.common import (
 )
 from utils.constants import CLASS_NAMES, LABEL_MAP
 
+import warnings
+warnings.filterwarnings("ignore", message=".*torch.load.*weights_only=False.*")
 
 # ---------------------------------------------------------------------------
 # Project constants

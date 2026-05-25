@@ -12,6 +12,9 @@ import src.ModelTrain as ModelTrain
 from utils.common import RESULTS_DIR, resolve_data_path
 from utils.constants import VALIDATION_CSV, VALIDATION_IMAGES_DIR
 
+import warnings
+warnings.filterwarnings("ignore", message=".*torch.load.*weights_only=False.*")
+
 
 class ExperimentRun(TypedDict):
     results_dir: str | Path
@@ -74,7 +77,7 @@ def run_training_experiment(
             config=config,
         )
 
-    print(f"Cargando modelo guardado desde: {best_model_weights_path}")
+    print(f"Loading model located at: {best_model_weights_path}")
     trained_model = ModelTrain.PolypClassifier(
         num_classes=len(ModelTrain.CLASS_NAMES),
         dropout=config.dropout,
