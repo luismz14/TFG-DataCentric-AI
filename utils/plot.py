@@ -12,6 +12,7 @@ from sklearn.metrics import (
 )
 
 import src.ModelTrain as ModelTrain
+from src.architecture import with_architecture_results_dir
 from src.experiment_runner import run_training_experiment
 from utils.common import RESULTS_DIR
 
@@ -128,5 +129,5 @@ def plotTrainResults(
         config=train,
         force_train=force_train,
     )
-    show_training_plots(results_dir)
+    show_training_plots(with_architecture_results_dir(train.architecture, results_dir))
     print_validation_metrics(trained_model, validation_loader)

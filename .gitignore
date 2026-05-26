@@ -20,7 +20,6 @@ build/
 data/patient_content/
 data/unified_images/
 data/phase2/frames/*
-results/*
 data/phase2/framesv2/*
 
 

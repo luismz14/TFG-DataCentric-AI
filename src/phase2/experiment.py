@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import pandas as pd
 
+import src.ModelTrain as ModelTrain
+from src.architecture import with_architecture_results_dir
 from src.VideoIngestor import augment_dataset
 from src.baseline_config import BASELINE_CONFIG
 from src.experiment_reporting import print_experiment_summary
@@ -101,24 +103,46 @@ def print_phase2_detection_summary() -> None:
     print(output.to_string(index=False))
 
 
-def run_phase2_experiments(force_train: bool = False) -> None:
+def _results_dirs_for_config(
+    training_config: ModelTrain.TrainingConfig,
+) -> list[dict]:
+    return [
+        {
+            **run,
+            "results_dir": with_architecture_results_dir(
+                training_config.architecture,
+                run["results_dir"],
+            ),
+        }
+        for run in PHASE2_RUNS
+    ]
+
+
+def run_phase2_experiments(
+    force_train: bool = False,
+    training_config: ModelTrain.TrainingConfig = BASELINE_CONFIG,
+) -> None:
     run_training_experiments(
         runs=PHASE2_RUNS,
         train_csv=PHASE2_TRAIN_CSV,
         train_images_dir=PHASE2_FRAMES_DIR,
-        base_config=BASELINE_CONFIG,
+        base_config=training_config,
         force_train=force_train,
     )
 
 
-def show_phase2_plots() -> None:
-    for run in PHASE2_RUNS:
+def show_phase2_plots(
+    training_config: ModelTrain.TrainingConfig = BASELINE_CONFIG,
+) -> None:
+    for run in _results_dirs_for_config(training_config):
         show_training_plots(run["results_dir"])
 
 
-def print_phase2_summary() -> None:
+def print_phase2_summary(
+    training_config: ModelTrain.TrainingConfig = BASELINE_CONFIG,
+) -> None:
     print_experiment_summary(
         results_dirs=[run["results_dir"] for run in PHASE2_RUNS],
-        training_config=BASELINE_CONFIG,
+        training_config=training_config,
         random_states=[run["random_state"] for run in PHASE2_RUNS],
     )

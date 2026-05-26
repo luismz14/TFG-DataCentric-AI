@@ -27,6 +27,7 @@ from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torchvision import transforms
 from tqdm import tqdm
 
+from src.architecture import EFFICIENTNET_B0
 from .PolypClassifier import PolypClassifier
 from utils.common import (
     RESULTS_DIR,
@@ -54,6 +55,7 @@ TRAINING_REQUIRED_COLUMNS = ["histology", "filename"]
 class TrainingConfig:
     """Baseline hyperparameters fixed across the data-centric experiments."""
 
+    architecture: str = EFFICIENTNET_B0
     random_state: int = 42
 
     input_size: int = 224
@@ -664,6 +666,7 @@ def train(
         num_classes=len(CLASS_NAMES),
         dropout=config.dropout,
         stochastic_depth_prob=config.stochastic_depth_prob,
+        architecture=config.architecture,
     ).to(device)
 
     optimizer, scheduler, training_stage = build_optimizer(

@@ -8,9 +8,11 @@ import torch
 import torch.nn as nn
 from torchvision import models
 
+from src.architecture import EFFICIENTNET_B0, VIT_SMALL
+
 
 class PolypClassifier(nn.Module):
-    """EfficientNet-B0 classifier prepared for staged fine-tuning.
+    """Classifier prepared for staged fine-tuning.
 
     The model starts from ImageNet-pretrained weights, replaces the original
     classifier head and exposes helper methods so the training pipeline can move
@@ -22,21 +24,48 @@ class PolypClassifier(nn.Module):
         num_classes: int,
         dropout: float = 0.30,
         stochastic_depth_prob: float = 0.10,
+        architecture: str = EFFICIENTNET_B0,
     ) -> None:
         super().__init__()
+        self.architecture = architecture
 
-        self.backbone = models.efficientnet_b0(
-            weights=models.EfficientNet_B0_Weights.DEFAULT,
-            stochastic_depth_prob=stochastic_depth_prob,
-        )
+        if self.architecture == EFFICIENTNET_B0:
+            self.backbone = models.efficientnet_b0(
+                weights=models.EfficientNet_B0_Weights.DEFAULT,
+                stochastic_depth_prob=stochastic_depth_prob,
+            )
 
-        in_features = self.backbone.classifier[1].in_features
-        self.backbone.classifier = nn.Sequential(
-            nn.Dropout(p=dropout, inplace=True),
-            nn.Linear(in_features, num_classes),
-        )
+            in_features = self.backbone.classifier[1].in_features
+            self.backbone.classifier = nn.Sequential(
+                nn.Dropout(p=dropout, inplace=True),
+                nn.Linear(in_features, num_classes),
+            )
+            self._head_param_prefixes = ("classifier",)
+            self._frozen_feature_block_ids: set[int] = set()
 
-        self._frozen_feature_block_ids: set[int] = set()
+        elif self.architecture == VIT_SMALL:
+            try:
+                import timm
+            except ImportError as exc:
+                raise ImportError(
+                    "Using architecture='vit_small' requires the 'timm' package. "
+                    "Install it with `pip install timm`."
+                ) from exc
+
+            self.backbone = timm.create_model(
+                "vit_small_patch16_224",
+                pretrained=True,
+                num_classes=num_classes,
+                drop_rate=dropout,
+                drop_path_rate=stochastic_depth_prob,
+            )
+            self._head_param_prefixes = ("head",)
+        else:
+            raise ValueError(
+                f"Unsupported architecture '{architecture}'. "
+                f"Use '{EFFICIENTNET_B0}' or '{VIT_SMALL}'."
+            )
+
         self.freeze_backbone()
         self.unfreeze_classifier()
 
@@ -45,16 +74,18 @@ class PolypClassifier(nn.Module):
         return self.backbone(x)
 
     def freeze_backbone(self) -> None:
-        """Freeze every convolutional feature block."""
-        for param in self.backbone.features.parameters():
+        """Freeze all non-classification parameters."""
+        for param in self.backbone.parameters():
             param.requires_grad = False
 
-        self._frozen_feature_block_ids = set(range(len(self.backbone.features)))
+        if self.architecture == EFFICIENTNET_B0:
+            self._frozen_feature_block_ids = set(range(len(self.backbone.features)))
 
     def unfreeze_classifier(self) -> None:
         """Keep the classification head trainable."""
-        for param in self.backbone.classifier.parameters():
-            param.requires_grad = True
+        for name, param in self.backbone.named_parameters():
+            if self._is_head_parameter(name):
+                param.requires_grad = True
 
     def unfreeze_all(self) -> None:
         """Unfreeze the full network for end-to-end fine-tuning."""
@@ -62,6 +93,12 @@ class PolypClassifier(nn.Module):
             param.requires_grad = True
 
         self._frozen_feature_block_ids = set()
+
+    def _is_head_parameter(self, name: str) -> bool:
+        return any(
+            name == prefix or name.startswith(f"{prefix}.")
+            for prefix in self._head_param_prefixes
+        )
 
     def get_trainable_parameter_groups(
         self,
@@ -81,7 +118,7 @@ class PolypClassifier(nn.Module):
             if not param.requires_grad:
                 continue
 
-            if name.startswith("classifier"):
+            if self._is_head_parameter(name):
                 head_params.append(param)
             else:
                 backbone_params.append(param)
@@ -110,7 +147,7 @@ class PolypClassifier(nn.Module):
 
         super().train(mode)
 
-        if mode:
+        if mode and self.architecture == EFFICIENTNET_B0:
             for block_idx in self._frozen_feature_block_ids:
                 self.backbone.features[block_idx].eval()
 

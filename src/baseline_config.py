@@ -1,11 +1,15 @@
 """Fixed baseline training recipe shared by all data-centric phases."""
 
+from dataclasses import fields
+
+from src.architecture import EFFICIENTNET_B0
 from src.ModelTrain import TrainingConfig
 
 
 # This configuration is intentionally fixed across phases so metric changes can
 # be attributed to data changes instead of training recipe changes.
 BASELINE_CONFIG = TrainingConfig(
+    architecture=EFFICIENTNET_B0,
     random_state=42,
     input_size=224,
     val_resize_size=256,
@@ -13,8 +17,8 @@ BASELINE_CONFIG = TrainingConfig(
     num_workers=2,
     num_epochs=200,
     warmup_epochs=3,
-    head_lr=1e-4,
-    fine_tune_head_lr=1e-4,
+    head_lr=1e-5,
+    fine_tune_head_lr=1e-5,
     backbone_lr=1e-6,
     weight_decay=5e-4,
     dropout=0.3,
@@ -28,3 +32,15 @@ BASELINE_CONFIG = TrainingConfig(
     use_weighted_loss=False,
     class_weight_exponent=0.5,
 )
+
+
+def build_training_config(architecture: str = EFFICIENTNET_B0) -> TrainingConfig:
+    """Return the fixed baseline recipe for the selected architecture."""
+    config = TrainingConfig(
+        **{
+            field.name: getattr(BASELINE_CONFIG, field.name)
+            for field in fields(BASELINE_CONFIG)
+        }
+    )
+    config.architecture = architecture
+    return config

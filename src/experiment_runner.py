@@ -9,6 +9,7 @@ from typing import Iterable, TypedDict
 import torch
 
 import src.ModelTrain as ModelTrain
+from src.architecture import with_architecture_results_dir
 from utils.common import RESULTS_DIR, resolve_data_path
 from utils.constants import VALIDATION_CSV, VALIDATION_IMAGES_DIR
 
@@ -57,7 +58,11 @@ def run_training_experiment(
 ) -> tuple[ModelTrain.PolypClassifier, torch.utils.data.DataLoader]:
     """Train or load one baseline experiment without showing notebook plots."""
 
-    results_path = RESULTS_DIR / Path(results_dir)
+    architecture_results_dir = with_architecture_results_dir(
+        config.architecture,
+        results_dir,
+    )
+    results_path = RESULTS_DIR / architecture_results_dir
     best_model_weights_path = results_path / "best_baseline_model.pth"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -73,7 +78,7 @@ def run_training_experiment(
             validation_csv_name=VALIDATION_CSV,
             images_dir_name=train_images_dir,
             validation_images_dir_name=VALIDATION_IMAGES_DIR,
-            save_dir=results_dir,
+            save_dir=architecture_results_dir,
             config=config,
         )
 
@@ -82,6 +87,7 @@ def run_training_experiment(
         num_classes=len(ModelTrain.CLASS_NAMES),
         dropout=config.dropout,
         stochastic_depth_prob=config.stochastic_depth_prob,
+        architecture=config.architecture,
     ).to(device)
     trained_model.load_state_dict(load_model_weights(best_model_weights_path, device))
     trained_model.eval()

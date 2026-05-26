@@ -14,6 +14,7 @@ from sklearn.metrics import (
 )
 
 import src.ModelTrain as ModelTrain
+from src.architecture import with_architecture_results_dir
 from utils.common import RESULTS_DIR, resolve_data_path
 
 import warnings
@@ -95,7 +96,11 @@ def _evaluate_results_dir(
     config: ModelTrain.TrainingConfig,
 ) -> dict[str, float | str]:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    results_path = RESULTS_DIR / Path(results_dir)
+    architecture_results_dir = with_architecture_results_dir(
+        config.architecture,
+        results_dir,
+    )
+    results_path = RESULTS_DIR / architecture_results_dir
     weights_path = results_path / "best_baseline_model.pth"
 
     if not results_path.exists():
@@ -115,6 +120,7 @@ def _evaluate_results_dir(
         num_classes=len(ModelTrain.CLASS_NAMES),
         dropout=config.dropout,
         stochastic_depth_prob=config.stochastic_depth_prob,
+        architecture=config.architecture,
     ).to(device)
     model.load_state_dict(_load_model_weights(weights_path, device))
     model.eval()
@@ -135,7 +141,7 @@ def _evaluate_results_dir(
     y_pred_array = np.array(y_pred)
 
     metrics: dict[str, float | str] = {
-        "results_dir": Path(results_dir).name,
+        "results_dir": architecture_results_dir.name,
         "random_state": int(config.random_state),
         "accuracy": float(accuracy_score(y_true_array, y_pred_array)),
         "balanced_accuracy": float(

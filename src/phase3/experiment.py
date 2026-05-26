@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import src.ModelTrain as ModelTrain
+from src.architecture import with_architecture_results_dir
 from src.baseline_config import BASELINE_CONFIG
 from src.experiment_reporting import print_experiment_summary
 from src.experiment_runner import run_training_experiments
@@ -38,10 +40,27 @@ def _runs_for_descriptor(descriptor: str) -> list[dict]:
     ]
 
 
+def _results_dirs_for_config(
+    descriptor: str,
+    training_config: ModelTrain.TrainingConfig,
+) -> list[dict]:
+    return [
+        {
+            **run,
+            "results_dir": with_architecture_results_dir(
+                training_config.architecture,
+                run["results_dir"],
+            ),
+        }
+        for run in _runs_for_descriptor(descriptor)
+    ]
+
+
 def train_phase3_dataset(
     train_csv: str | Path,
     force_train: bool = False,
     descriptor: str | None = None,
+    training_config: ModelTrain.TrainingConfig = BASELINE_CONFIG,
 ) -> str:
     train_csv = _csv_relative_to_data(train_csv)
     descriptor = descriptor or descriptor_from_csv(train_csv)
@@ -49,24 +68,33 @@ def train_phase3_dataset(
         runs=_runs_for_descriptor(descriptor),
         train_csv=train_csv,
         train_images_dir=PHASE3_IMAGES_DIR,
-        base_config=BASELINE_CONFIG,
+        base_config=training_config,
         force_train=force_train,
     )
     return descriptor
 
 
-def show_phase3_plots(train_csv: str | Path, descriptor: str | None = None) -> None:
+def show_phase3_plots(
+    train_csv: str | Path,
+    descriptor: str | None = None,
+    training_config: ModelTrain.TrainingConfig = BASELINE_CONFIG,
+) -> None:
     descriptor = descriptor or descriptor_from_csv(train_csv)
-    for run in _runs_for_descriptor(descriptor):
+    for run in _results_dirs_for_config(descriptor, training_config):
         show_training_plots(run["results_dir"])
 
 
-def print_phase3_summary(train_csv: str | Path, descriptor: str | None = None) -> None:
+def print_phase3_summary(
+    train_csv: str | Path,
+    descriptor: str | None = None,
+    training_config: ModelTrain.TrainingConfig = BASELINE_CONFIG,
+) -> None:
     descriptor = descriptor or descriptor_from_csv(train_csv)
+    runs = _runs_for_descriptor(descriptor)
     print_experiment_summary(
-        results_dirs=[run["results_dir"] for run in _runs_for_descriptor(descriptor)],
-        training_config=BASELINE_CONFIG,
-        random_states=[run["random_state"] for run in _runs_for_descriptor(descriptor)],
+        results_dirs=[run["results_dir"] for run in runs],
+        training_config=training_config,
+        random_states=[run["random_state"] for run in runs],
     )
 
 
