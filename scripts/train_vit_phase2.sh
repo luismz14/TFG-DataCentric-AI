@@ -7,10 +7,4 @@ cd "${REPO_ROOT}"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 
-"${PYTHON_BIN}" - <<'PY'
-from src.baseline_config import build_training_config
-from src.phase2.experiment import run_phase2_experiments
-
-training_config = build_training_config(architecture="vit_small")
-run_phase2_experiments(training_config=training_config, force_train=False)
-PY
+"${PYTHON_BIN}" scripts/train_vit.py phase2
