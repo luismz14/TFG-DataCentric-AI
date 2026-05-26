@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pandas as pd
+
 from src.VideoIngestor import augment_dataset
 from src.baseline_config import BASELINE_CONFIG
 from src.experiment_reporting import print_experiment_summary
@@ -49,6 +51,54 @@ def print_phase2_train_summary() -> None:
     train_df = read_csv(resolve_data_path(PHASE2_TRAIN_CSV))
     print(train_df["histology"].value_counts().to_string())
     print(f"total: {len(train_df)}")
+
+
+def print_phase2_detection_summary() -> None:
+    train_df = read_csv(resolve_data_path(PHASE2_TRAIN_CSV))
+    train_df = train_df.copy()
+    train_df["detection_confidence"] = train_df["detection_confidence"].fillna(0.0)
+    train_df["has_annotation"] = train_df["detection_confidence"].gt(0)
+    train_df["annotated_detection_confidence"] = train_df[
+        "detection_confidence"
+    ].where(train_df["has_annotation"])
+
+    summary = (
+        train_df.groupby("histology", dropna=False)
+        .agg(
+            total_images=("filename", "size"),
+            annotated_images=("has_annotation", "sum"),
+            unannotated_images=("has_annotation", lambda values: (~values).sum()),
+            mean_annotated_confidence=("annotated_detection_confidence", "mean"),
+        )
+        .reset_index()
+    )
+
+    overall = pd.DataFrame(
+        [
+            {
+                "histology": "TOTAL",
+                "total_images": len(train_df),
+                "annotated_images": int(train_df["has_annotation"].sum()),
+                "unannotated_images": int((~train_df["has_annotation"]).sum()),
+                "mean_annotated_confidence": train_df[
+                    "annotated_detection_confidence"
+                ].mean(),
+            }
+        ]
+    )
+
+    output = (
+        pd.concat([overall, summary], ignore_index=True)
+        .assign(
+            annotated_images=lambda df: df["annotated_images"].astype(int),
+            unannotated_images=lambda df: df["unannotated_images"].astype(int),
+            total_images=lambda df: df["total_images"].astype(int),
+            mean_annotated_confidence=lambda df: df[
+                "mean_annotated_confidence"
+            ].round(4),
+        )
+    )
+    print(output.to_string(index=False))
 
 
 def run_phase2_experiments(force_train: bool = False) -> None:
