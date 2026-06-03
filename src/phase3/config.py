@@ -28,3 +28,6 @@ PHASE3_RUNS = [
     {"seed_name": "seed_3", "random_state": 456},
     {"seed_name": "seed_4", "random_state": 789},
 ]
+
+
+# wilcoxon signed rank test (como justificar los resultados que tenemos)
