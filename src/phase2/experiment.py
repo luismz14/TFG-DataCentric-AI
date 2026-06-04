@@ -14,6 +14,7 @@ from src.phase2.config import (
     PHASE2_FULL_TRAIN_CSV,
     PHASE2_HALF_PRECISION,
     PHASE2_IMAGE_SIZE,
+    PHASE2_CONFIDENCE_ONLY_THRESHOLD,
     PHASE2_KINF_CONFIDENCE_THRESHOLD,
     PHASE2_MAX_CANDIDATES_PER_VIDEO,
     PHASE2_MAX_PREFETCH_VIDEOS,
@@ -34,13 +35,27 @@ def print_phase2_source_summary() -> None:
     print(f"total: {len(source_df)}")
 
 
-def ingest_phase2_dataset() -> dict[str, int | str | bool]:
-    return augment_dataset(
+def phase2_confidence_only_csv_path(confidence_threshold: float) -> Path:
+    threshold_tag = int(round(float(confidence_threshold) * 100))
+    return PHASE2_FULL_TRAIN_CSV.with_name(
+        f"phase2_train_conf{threshold_tag:03d}.csv"
+    )
+
+
+def ingest_phase2_dataset(
+    confidence_threshold: float | None = None,
+) -> dict[str, int | str | bool | float]:
+    output_csv_path = (
+        phase2_confidence_only_csv_path(confidence_threshold)
+        if confidence_threshold is not None
+        else PHASE2_FULL_TRAIN_CSV
+    )
+    summary = augment_dataset(
         yolo_weights_path=PHASE2_YOLO_WEIGHTS,
         metadata_csv_path=resolve_data_path(PHASE2_SOURCE_CSV),
         dataset_inventory_path=resolve_data_path(PHASE2_DATASET_INVENTORY),
         output_dir=resolve_data_path(PHASE2_FRAMES_DIR),
-        output_csv_path=resolve_data_path(PHASE2_FULL_TRAIN_CSV),
+        output_csv_path=resolve_data_path(output_csv_path),
         max_candidates_per_video=PHASE2_MAX_CANDIDATES_PER_VIDEO,
         target_fps=PHASE2_TARGET_FPS,
         window_sec=PHASE2_WINDOW_SEC,
@@ -48,7 +63,20 @@ def ingest_phase2_dataset() -> dict[str, int | str | bool]:
         half=PHASE2_HALF_PRECISION,
         imgsz=PHASE2_IMAGE_SIZE,
         max_prefetch_videos=PHASE2_MAX_PREFETCH_VIDEOS,
+        min_detection_confidence=confidence_threshold,
+        use_histology_candidate_limits=confidence_threshold is None,
     )
+    summary["confidence_threshold"] = (
+        "none" if confidence_threshold is None else float(confidence_threshold)
+    )
+    summary["use_histology_candidate_limits"] = confidence_threshold is None
+    return summary
+
+
+def ingest_phase2_confidence_only_dataset(
+    confidence_threshold: float = PHASE2_CONFIDENCE_ONLY_THRESHOLD,
+) -> dict[str, int | str | bool | float]:
+    return ingest_phase2_dataset(confidence_threshold=confidence_threshold)
 
 
 def curate_phase2_kinf_dataset() -> dict[str, int | str | float]:
@@ -183,8 +211,8 @@ def show_phase2_plots(
 
 def print_phase2_summary(
     training_config: ModelTrain.TrainingConfig = BASELINE_CONFIG,
-) -> None:
-    print_experiment_summary(
+) -> pd.DataFrame:
+    return print_experiment_summary(
         results_dirs=[run["results_dir"] for run in PHASE2_RUNS],
         training_config=training_config,
         random_states=[run["random_state"] for run in PHASE2_RUNS],

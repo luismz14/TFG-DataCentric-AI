@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pandas as pd
+
 import src.ModelTrain as ModelTrain
 from src.architecture import with_architecture_results_dir
 from src.baseline_config import BASELINE_CONFIG
@@ -48,8 +50,8 @@ def show_phase1_plots(
 
 def print_phase1_summary(
     training_config: ModelTrain.TrainingConfig = BASELINE_CONFIG,
-) -> None:
-    print_experiment_summary(
+) -> pd.DataFrame:
+    return print_experiment_summary(
         results_dirs=[run["results_dir"] for run in PHASE1_RUNS],
         training_config=training_config,
         random_states=[run["random_state"] for run in PHASE1_RUNS],

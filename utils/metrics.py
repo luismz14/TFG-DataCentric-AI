@@ -5,12 +5,14 @@ from dataclasses import fields
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
 from sklearn.metrics import (
     accuracy_score,
-    balanced_accuracy_score,
-    classification_report,
     f1_score,
+    matthews_corrcoef,
+    precision_score,
+    recall_score,
 )
 
 import src.ModelTrain as ModelTrain
@@ -19,6 +21,11 @@ from utils.common import RESULTS_DIR, resolve_data_path
 
 import warnings
 warnings.filterwarnings("ignore", message=".*torch.load.*weights_only=False.*")
+
+
+SUMMARY_ROWS = ["general", *ModelTrain.CLASS_NAMES]
+SUMMARY_COLUMNS = ["accuracy", "mcc", "macro_f1", "precision", "recall"]
+METRIC_KEY_SEPARATOR = "::"
 
 
 def _clone_config(config: ModelTrain.TrainingConfig) -> ModelTrain.TrainingConfig:
@@ -50,27 +57,79 @@ def _resolve_random_states(
     return [int(random_state) for random_state in random_states]
 
 
-def _flatten_report_metrics(report_dict: dict[str, object]) -> dict[str, float]:
-    flattened: dict[str, float] = {}
+def _metric_key(row_name: str, metric_name: str) -> str:
+    return f"{row_name}{METRIC_KEY_SEPARATOR}{metric_name}"
 
-    for section_name, section_value in report_dict.items():
-        if section_name == "accuracy":
-            continue
 
-        if not isinstance(section_value, dict):
-            continue
+def _general_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
+    return {
+        _metric_key("general", "accuracy"): float(accuracy_score(y_true, y_pred)),
+        _metric_key("general", "mcc"): float(matthews_corrcoef(y_true, y_pred)),
+        _metric_key("general", "macro_f1"): float(
+            f1_score(y_true, y_pred, average="macro", zero_division=0)
+        ),
+        _metric_key("general", "precision"): float(
+            precision_score(y_true, y_pred, average="macro", zero_division=0)
+        ),
+        _metric_key("general", "recall"): float(
+            recall_score(y_true, y_pred, average="macro", zero_division=0)
+        ),
+    }
 
-        if "support" in section_value and len(section_value) == 1:
-            continue
 
-        for metric_name, metric_value in section_value.items():
-            if metric_name == "support":
-                continue
+def _class_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
+    metrics: dict[str, float] = {}
 
-            metric_group = section_name.replace(" ", "_")
-            flattened[f"{metric_group}_{metric_name}"] = float(metric_value)
+    for class_idx, class_name in enumerate(ModelTrain.CLASS_NAMES):
+        class_true = y_true == class_idx
+        class_pred = y_pred == class_idx
+        metrics.update(
+            {
+                _metric_key(class_name, "accuracy"): float(
+                    accuracy_score(class_true, class_pred)
+                ),
+                _metric_key(class_name, "mcc"): float(
+                    matthews_corrcoef(class_true, class_pred)
+                ),
+                _metric_key(class_name, "macro_f1"): float(
+                    f1_score(class_true, class_pred, zero_division=0)
+                ),
+                _metric_key(class_name, "precision"): float(
+                    precision_score(class_true, class_pred, zero_division=0)
+                ),
+                _metric_key(class_name, "recall"): float(
+                    recall_score(class_true, class_pred, zero_division=0)
+                ),
+            }
+        )
 
-    return flattened
+    return metrics
+
+
+def _format_mean_std(mean_value: float, std_value: float) -> str:
+    if np.isnan(std_value):
+        return f"{mean_value:.4f} +/- n/a"
+    return f"{mean_value:.4f} +/- {std_value:.4f}"
+
+
+def _summarize_per_run_metrics(
+    per_run_metrics: list[dict[str, float | str]],
+) -> pd.DataFrame:
+    rows = []
+    for row_name in SUMMARY_ROWS:
+        row = {"scope": row_name}
+        for metric_name in SUMMARY_COLUMNS:
+            key = _metric_key(row_name, metric_name)
+            values = np.array(
+                [float(run_metrics[key]) for run_metrics in per_run_metrics],
+                dtype=float,
+            )
+            mean_value = float(values.mean())
+            std_value = float(values.std(ddof=1)) if len(values) > 1 else float("nan")
+            row[metric_name] = _format_mean_std(mean_value, std_value)
+        rows.append(row)
+
+    return pd.DataFrame(rows)
 
 
 def _build_validation_loader(
@@ -143,27 +202,9 @@ def _evaluate_results_dir(
     metrics: dict[str, float | str] = {
         "results_dir": architecture_results_dir.name,
         "random_state": int(config.random_state),
-        "accuracy": float(accuracy_score(y_true_array, y_pred_array)),
-        "balanced_accuracy": float(
-            balanced_accuracy_score(y_true_array, y_pred_array)
-        ),
-        "macro_f1": float(
-            f1_score(y_true_array, y_pred_array, average="macro", zero_division=0)
-        ),
-        "weighted_f1": float(
-            f1_score(y_true_array, y_pred_array, average="weighted", zero_division=0)
-        ),
     }
-
-    report_dict = classification_report(
-        y_true_array,
-        y_pred_array,
-        labels=list(range(len(ModelTrain.CLASS_NAMES))),
-        target_names=ModelTrain.CLASS_NAMES,
-        zero_division=0,
-        output_dict=True,
-    )
-    metrics.update(_flatten_report_metrics(report_dict))
+    metrics.update(_general_metrics(y_true_array, y_pred_array))
+    metrics.update(_class_metrics(y_true_array, y_pred_array))
 
     return metrics
 
@@ -174,7 +215,7 @@ def print_results_metrics_summary(
     validation_img_dir: str | Path,
     training_config: ModelTrain.TrainingConfig,
     random_states: Sequence[int] | None = None,
-) -> None:
+) -> pd.DataFrame:
     if not results_dirs:
         raise ValueError("`results_dirs` cannot be empty.")
 
@@ -198,17 +239,4 @@ def print_results_metrics_summary(
             )
         )
 
-    metric_names = [
-        metric_name
-        for metric_name in per_run_metrics[0]
-        if metric_name not in {"results_dir", "random_state"}
-    ]
-    
-    for metric_name in metric_names:
-        values = np.array(
-            [float(run_metrics[metric_name]) for run_metrics in per_run_metrics],
-            dtype=float,
-        )
-        mean_value = float(values.mean())
-        std_value = float(values.std(ddof=1)) if len(values) > 1 else float("nan")
-        print(f"{metric_name}: mean={mean_value:.4f}, std={std_value:.4f}")
+    return _summarize_per_run_metrics(per_run_metrics)

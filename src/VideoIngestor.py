@@ -338,6 +338,8 @@ def _build_phase2_source_signature(
     yolo_weights_path: str | Path,
     output_dir: str | Path,
     max_candidates_per_video: int,
+    min_detection_confidence: float | None,
+    use_histology_candidate_limits: bool,
     target_fps: int,
     window_sec: int,
     half: bool,
@@ -353,6 +355,12 @@ def _build_phase2_source_signature(
     payload = {
         "config": {
             "max_candidates_per_video": int(max_candidates_per_video),
+            "min_detection_confidence": (
+                None
+                if min_detection_confidence is None
+                else float(min_detection_confidence)
+            ),
+            "use_histology_candidate_limits": bool(use_histology_candidate_limits),
             "output_dir": str(Path(output_dir)),
             "target_fps": int(target_fps),
             "window_sec": int(window_sec),
@@ -646,6 +654,8 @@ class VideoIngestor:
         conf_threshold: float = 0.15,
         min_track_hits: int = 2,
         max_candidates_per_video: int = 5,
+        min_detection_confidence: float | None = None,
+        use_histology_candidate_limits: bool = True,
         base_histology: str = "Adenoma",
         base_candidates: int = 1,
         candidate_exponent: float = 1.0,
@@ -664,6 +674,8 @@ class VideoIngestor:
         self.target_fps = target_fps
         self.window_sec = window_sec
         self.conf_threshold = conf_threshold
+        self.min_detection_confidence = min_detection_confidence
+        self.use_histology_candidate_limits = use_histology_candidate_limits
         self.min_track_hits = min_track_hits
         self.max_candidates_per_video = max_candidates_per_video
         self.base_histology = base_histology
@@ -1038,6 +1050,12 @@ class VideoIngestor:
         if metadata_df.empty:
             raise ValueError("Cannot build candidates without valid histology rows.")
 
+        if not self.use_histology_candidate_limits:
+            return {
+                histology: int(self.max_candidates_per_video)
+                for histology in PHASE2_HISTOLOGY_ORDER
+            }
+
         class_counts = (
             metadata_df["histology"]
             .value_counts()
@@ -1294,6 +1312,15 @@ class VideoIngestor:
         min_gap_frames: int,
     ) -> list[int]:
         frames = sorted(set(track_data["frames"]))
+        if self.min_detection_confidence is not None:
+            frames = [
+                frame_idx
+                for frame_idx in frames
+                if track_data["metadata_by_frame"]
+                .get(frame_idx, self._default_detection_metadata())
+                .get("detection_confidence", 0.0)
+                >= self.min_detection_confidence
+            ]
         ordered = sorted(frames, key=lambda f: abs(f - timestamp_frame))
 
         selected = []
@@ -1311,6 +1338,11 @@ class VideoIngestor:
         timestamp_frame: int,
         max_candidates: int,
     ) -> list[int]:
+        if (
+            self.min_detection_confidence is not None
+            and self.min_detection_confidence > 0
+        ):
+            return []
         ordered = sorted(sampled_indices, key=lambda f: abs(f - timestamp_frame))
         return sorted(ordered[:max_candidates])
 
@@ -1369,6 +1401,8 @@ def augment_dataset(
     half: bool,
     imgsz: int,
     max_prefetch_videos: int,
+    min_detection_confidence: float | None = None,
+    use_histology_candidate_limits: bool = True,
 ) -> dict[str, int | str | bool]:
     metadata_csv_path = Path(metadata_csv_path)
     dataset_inventory_path = Path(dataset_inventory_path)
@@ -1387,6 +1421,8 @@ def augment_dataset(
                 yolo_weights_path=yolo_weights_path,
                 output_dir=output_dir,
                 max_candidates_per_video=max_candidates_per_video,
+                min_detection_confidence=min_detection_confidence,
+                use_histology_candidate_limits=use_histology_candidate_limits,
                 target_fps=target_fps,
                 window_sec=window_sec,
                 half=half,
@@ -1424,6 +1460,8 @@ def augment_dataset(
         yolo_weights_path=yolo_weights_path,
         output_dir=output_dir,
         max_candidates_per_video=max_candidates_per_video,
+        min_detection_confidence=min_detection_confidence,
+        use_histology_candidate_limits=use_histology_candidate_limits,
         target_fps=target_fps,
         window_sec=window_sec,
         half=half,
@@ -1478,6 +1516,8 @@ def augment_dataset(
         target_fps=target_fps,
         window_sec=window_sec,
         max_candidates_per_video=max_candidates_per_video,
+        min_detection_confidence=min_detection_confidence,
+        use_histology_candidate_limits=use_histology_candidate_limits,
         device=device,
         half=half,
         imgsz=imgsz,
