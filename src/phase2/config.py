@@ -7,7 +7,9 @@ PHASE2_YOLO_WEIGHTS = Path("utils/model/CVC_ClinicDB_yolov8m.pt")
 PHASE2_SOURCE_CSV = Path("phase1_train.csv")
 PHASE2_DATASET_INVENTORY = Path("dataset_inventory.json")
 PHASE2_FRAMES_DIR = Path("phase2/frames")
-PHASE2_TRAIN_CSV = Path("phase2/phase2_train.csv")
+PHASE2_FULL_TRAIN_CSV = Path("phase2/phase2_train.csv")
+PHASE2_TRAIN_CSV = Path("phase2/phase2_train_kinf.csv")
+PHASE2_KINF_CONFIDENCE_THRESHOLD = 0.40
 
 PHASE2_MAX_CANDIDATES_PER_VIDEO = 100
 PHASE2_TARGET_FPS = 5
