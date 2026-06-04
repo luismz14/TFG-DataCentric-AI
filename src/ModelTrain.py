@@ -21,6 +21,7 @@ import pandas as pd
 import seaborn as sns
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from sklearn.metrics import classification_report, confusion_matrix, f1_score
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
@@ -53,7 +54,7 @@ TRAINING_REQUIRED_COLUMNS = ["histology", "filename"]
 # Slot = True is used to reduce memory and speed up attribute access.
 @dataclass(slots=True)
 class TrainingConfig:
-    """Baseline hyperparameters fixed across the data-centric experiments."""
+    """Training hyperparameters fixed across the data-centric experiments."""
 
     architecture: str = EFFICIENTNET_B0
     random_state: int = 42
@@ -76,17 +77,25 @@ class TrainingConfig:
     weight_decay: float = 5e-4
     dropout: float = 0.30
     stochastic_depth_prob: float = 0.10
-    label_smoothing: float = 0.02
+    label_smoothing: float = 0.05
 
     # Adaptive training control.
     scheduler_factor: float = 0.5
     scheduler_patience: int = 4
-    early_stopping_patience: int = 12
-    min_lr: float = 1e-6
+    early_stopping_patience: int = 16
+    min_lr: float = 1e-7
     gradient_clip_norm: float = 1.0
 
+    # Class imbalance and objective.
+    loss: str = "focal"  # ce | weighted_ce | focal
     use_weighted_loss: bool = False
-    class_weight_exponent: float = 0.5
+    class_weight_exponent: float = 0.7
+    sampler_exponent: float = 0.4
+    focal_gamma: float = 2.0
+
+    # Data augmentation and checkpoint selection.
+    augment: str = "strong"  # baseline | strong
+    checkpoint_selection: str = "macro_f1"  # score | macro_f1
 
 
 @dataclass(slots=True)
@@ -198,38 +207,75 @@ def build_transforms(
         std=[0.229, 0.224, 0.225],
     )
 
-    train_transform = transforms.Compose(
-        [
-            transforms.ToPILImage(),
-            transforms.Resize(
-                (config.input_size, config.input_size),
-                interpolation=transforms.InterpolationMode.BICUBIC,
-            ),
-            transforms.RandomVerticalFlip(p=0.5),
-            transforms.RandomHorizontalFlip(p=0.2),
-            transforms.RandomAffine(
-                degrees=8,
-                translate=(0.03, 0.03),
-                scale=(0.97, 1.03),
-                interpolation=transforms.InterpolationMode.BICUBIC,
-            ),
-            transforms.ColorJitter(
-                brightness=0.12,
-                contrast=0.12,
-                saturation=0.04,
-                hue=0.01,
-            ),
-            transforms.ToTensor(),
-            normalize,
-        ]
-    )
+    interpolation = transforms.InterpolationMode.BICUBIC
+    if config.augment == "baseline":
+        train_transform = transforms.Compose(
+            [
+                transforms.ToPILImage(),
+                transforms.Resize(
+                    (config.input_size, config.input_size),
+                    interpolation=interpolation,
+                ),
+                transforms.RandomVerticalFlip(p=0.5),
+                transforms.RandomHorizontalFlip(p=0.2),
+                transforms.RandomAffine(
+                    degrees=8,
+                    translate=(0.03, 0.03),
+                    scale=(0.97, 1.03),
+                    interpolation=interpolation,
+                ),
+                transforms.ColorJitter(
+                    brightness=0.12,
+                    contrast=0.12,
+                    saturation=0.04,
+                    hue=0.01,
+                ),
+                transforms.ToTensor(),
+                normalize,
+            ]
+        )
+    elif config.augment == "strong":
+        train_transform = transforms.Compose(
+            [
+                transforms.ToPILImage(),
+                transforms.RandomResizedCrop(
+                    (config.input_size, config.input_size),
+                    scale=(0.7, 1.0),
+                    ratio=(0.85, 1.18),
+                    interpolation=interpolation,
+                ),
+                transforms.RandomVerticalFlip(p=0.5),
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.RandomAffine(
+                    degrees=20,
+                    translate=(0.08, 0.08),
+                    scale=(0.9, 1.1),
+                    interpolation=interpolation,
+                ),
+                transforms.ColorJitter(
+                    brightness=0.25,
+                    contrast=0.25,
+                    saturation=0.12,
+                    hue=0.03,
+                ),
+                transforms.RandomApply(
+                    [transforms.GaussianBlur(3, sigma=(0.1, 1.5))],
+                    p=0.2,
+                ),
+                transforms.ToTensor(),
+                normalize,
+                transforms.RandomErasing(p=0.25, scale=(0.02, 0.12)),
+            ]
+        )
+    else:
+        raise ValueError(f"Unknown augmentation policy: {config.augment}")
 
     val_transform = transforms.Compose(
         [
             transforms.ToPILImage(),
             transforms.Resize(
                 (config.input_size, config.input_size),
-                interpolation=transforms.InterpolationMode.BICUBIC,
+                interpolation=interpolation,
             ),
             transforms.ToTensor(),
             normalize,
@@ -272,7 +318,7 @@ def build_weighted_sampler(
 ) -> WeightedRandomSampler:
     """Create the weighted sampler used to rebalance training batches."""
     class_counts = get_class_counts(train_metadata_df).replace(0, 1)
-    class_sampling_weights = (1.0 / class_counts) ** config.class_weight_exponent
+    class_sampling_weights = (1.0 / class_counts) ** config.sampler_exponent
     sample_weights = [
         float(class_sampling_weights[histology])
         for histology in train_metadata_df["histology"]
@@ -351,23 +397,73 @@ def build_loss_weights(
     return weights_tensor / weights_tensor.mean()
 
 
+class FocalLoss(nn.Module):
+    """Multiclass focal loss with class weights and optional label smoothing."""
+
+    def __init__(
+        self,
+        gamma: float = 2.0,
+        alpha: torch.Tensor | None = None,
+        label_smoothing: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.gamma = gamma
+        self.register_buffer("alpha", alpha if alpha is not None else None)
+        self.label_smoothing = label_smoothing
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        log_probabilities = F.log_softmax(logits, dim=1)
+        cross_entropy = F.nll_loss(
+            log_probabilities,
+            target,
+            weight=self.alpha,
+            reduction="none",
+        )
+        if self.label_smoothing > 0:
+            smooth_loss = -log_probabilities.mean(dim=1)
+            cross_entropy = (
+                (1 - self.label_smoothing) * cross_entropy
+                + self.label_smoothing * smooth_loss
+            )
+
+        pt = torch.exp(-F.nll_loss(log_probabilities, target, reduction="none"))
+        return (((1 - pt) ** self.gamma) * cross_entropy).mean()
+
+
 def build_criterion(
     train_metadata_df: pd.DataFrame,
     config: TrainingConfig,
     device: torch.device,
-) -> tuple[nn.CrossEntropyLoss, torch.Tensor | None]:
-    """Create the cross-entropy loss used by the baseline."""
-    loss_weights = (
-        build_loss_weights(train_metadata_df, config).to(device)
-        if config.use_weighted_loss
-        else None
-    )
+) -> tuple[nn.Module, torch.Tensor | None]:
+    """Create the configured training criterion."""
+    loss_name = "weighted_ce" if config.use_weighted_loss else config.loss
+    loss_weights = None
+    if loss_name in {"weighted_ce", "focal"}:
+        loss_weights = build_loss_weights(train_metadata_df, config).to(device)
 
-    criterion = nn.CrossEntropyLoss(
-        weight=loss_weights,
-        label_smoothing=config.label_smoothing,
-    )
-    return criterion, loss_weights
+    if loss_name == "ce":
+        return (
+            nn.CrossEntropyLoss(label_smoothing=config.label_smoothing),
+            loss_weights,
+        )
+    if loss_name == "weighted_ce":
+        return (
+            nn.CrossEntropyLoss(
+                weight=loss_weights,
+                label_smoothing=config.label_smoothing,
+            ),
+            loss_weights,
+        )
+    if loss_name == "focal":
+        return (
+            FocalLoss(
+                gamma=config.focal_gamma,
+                alpha=loss_weights,
+                label_smoothing=config.label_smoothing,
+            ).to(device),
+            loss_weights,
+        )
+    raise ValueError(f"Unknown loss function: {config.loss}")
 
 
 def build_optimizer(
@@ -514,6 +610,7 @@ def evaluate_model(
 def compute_validation_scores(
     val_macro_f1_scores: list[float],
     val_losses: list[float],
+    selection: str = "score",
 ) -> np.ndarray:
     """Compute validation scores where lower is better."""
     if len(val_macro_f1_scores) != len(val_losses):
@@ -524,15 +621,20 @@ def compute_validation_scores(
 
     f1_values = np.asarray(val_macro_f1_scores, dtype=float)
     loss_values = np.asarray(val_losses, dtype=float)
-    return loss_values * (1.0 - f1_values)
+    if selection == "score":
+        return loss_values * (1.0 - f1_values)
+    if selection == "macro_f1":
+        return -f1_values
+    raise ValueError(f"Unknown checkpoint selection metric: {selection}")
 
 
 def select_best_epoch_by_validation_score(
     val_macro_f1_scores: list[float],
     val_losses: list[float],
+    selection: str = "score",
 ) -> tuple[int, np.ndarray]:
-    """Return the best epoch index using val_loss * (1 - macro_f1)."""
-    scores = compute_validation_scores(val_macro_f1_scores, val_losses)
+    """Return the best epoch index according to the configured validation score."""
+    scores = compute_validation_scores(val_macro_f1_scores, val_losses, selection)
 
     if len(scores) == 0:
         raise ValueError("At least one evaluated epoch is required.")
@@ -749,11 +851,12 @@ def train(
         current_best_epoch_idx, validation_scores = select_best_epoch_by_validation_score(
             history_val_f1,
             history_val_loss,
+            config.checkpoint_selection,
         )
         current_validation_score = float(validation_scores[-1])
         best_validation_score = float(validation_scores[current_best_epoch_idx])
 
-        scheduler.step(current_validation_score)
+        scheduler.step(validation_result.loss)
 
         best_checkpoint.validation_score = best_validation_score
         best_checkpoint.macro_f1 = history_val_f1[current_best_epoch_idx]
@@ -786,7 +889,7 @@ def train(
                 "Train Loss": f"{epoch_train_loss:.4f}",
                 "Val Loss": f"{validation_result.loss:.4f}",
                 "Val Macro F1": f"{validation_result.macro_f1:.4f}{checkpoint_status}",
-                "Val Score": f"{current_validation_score:.4f}",
+                "Selection Score": f"{current_validation_score:.4f}",
                 "Best Epoch": best_checkpoint.epoch,
                 "LR": format_learning_rates(optimizer),
             }
@@ -799,7 +902,7 @@ def train(
             print(
                 "Early stopping triggered after "
                 f"{config.early_stopping_patience} epochs without improving "
-                "the validation score."
+                f"{config.checkpoint_selection}."
             )
             break
 
@@ -810,6 +913,7 @@ def train(
     best_epoch_idx, validation_scores = select_best_epoch_by_validation_score(
         history_val_f1,
         history_val_loss,
+        config.checkpoint_selection,
     )
     best_checkpoint.validation_score = float(validation_scores[best_epoch_idx])
     best_checkpoint.macro_f1 = history_val_f1[best_epoch_idx]
