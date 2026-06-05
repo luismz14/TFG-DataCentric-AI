@@ -4,6 +4,7 @@ import math
 import os
 import shutil
 import sys
+import traceback
 import uuid
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -431,6 +432,7 @@ def _initialize_phase2_state(
         "source_signature": source_signature,
         "counts_by_histology": _empty_histology_counts(),
         "videos": video_states,
+        "video_errors": {},
     }
 
 
@@ -471,6 +473,12 @@ def _load_or_initialize_phase2_state(
         }:
             state["videos"][video_key] = PHASE2_VIDEO_STATE_PENDING
             changed = True
+
+    state["video_errors"] = {
+        str(video_key): error
+        for video_key, error in state.get("video_errors", {}).items()
+        if str(video_key) in expected_video_keys and isinstance(error, dict)
+    }
 
     state["counts_by_histology"] = {
         **_empty_histology_counts(),
@@ -531,6 +539,63 @@ def _phase2_baseline_output_df(sorted_df: pd.DataFrame) -> pd.DataFrame:
 
 def _initialize_phase2_output_csv(sorted_df: pd.DataFrame, output_csv_path: Path) -> None:
     write_csv(_phase2_baseline_output_df(sorted_df), output_csv_path)
+
+
+def _copy_original_file_to_phase2_output(
+    *,
+    filename: str,
+    output_dir: Path,
+    original_images_dir: str | Path = "data/images_cropped",
+) -> bool:
+    source_path = Path(original_images_dir) / filename
+    if not source_path.exists():
+        raise FileNotFoundError(f"Could not find original cropped image: {source_path}")
+
+    destination_path = output_dir / filename
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if source_path.resolve() == destination_path.resolve():
+        return False
+
+    if destination_path.exists():
+        if destination_path.stat().st_size > 0:
+            return False
+        destination_path.unlink()
+
+    try:
+        os.link(source_path, destination_path)
+    except OSError:
+        shutil.copy2(source_path, destination_path)
+    return True
+
+
+def _sync_phase2_original_images(
+    sorted_df: pd.DataFrame,
+    output_dir: str | Path,
+) -> dict[str, int]:
+    output_path = Path(output_dir)
+    copied = 0
+    already_present = 0
+    source_df = _finalize_phase2_output_columns(sorted_df)
+    original_filenames = source_df.loc[
+        source_df["source_type"].eq("original"),
+        "filename",
+    ]
+
+    for filename in original_filenames.astype(str).drop_duplicates():
+        was_copied = _copy_original_file_to_phase2_output(
+            filename=filename,
+            output_dir=output_path,
+        )
+        if was_copied:
+            copied += 1
+        else:
+            already_present += 1
+
+    return {
+        "original_images_copied": copied,
+        "original_images_already_present": already_present,
+    }
 
 
 def _read_phase2_output_or_baseline(
@@ -1490,6 +1555,8 @@ def augment_dataset(
     if state_is_new or state_changed or state_repaired:
         _save_phase2_state(state, state_path)
 
+    original_sync_summary = _sync_phase2_original_images(sorted_df, output_dir)
+
     output_df = _read_phase2_output_or_baseline(output_csv_path, sorted_df)
     if _phase2_state_is_complete(state, output_csv_path):
         return {
@@ -1502,6 +1569,7 @@ def augment_dataset(
             "rows_output": len(output_df),
             "output_csv_path": str(output_csv_path),
             "state_json_path": str(state_path),
+            **original_sync_summary,
         }
 
     work_items = []
@@ -1579,6 +1647,7 @@ def augment_dataset(
             )
 
             state["videos"][video_key] = PHASE2_VIDEO_STATE_DONE
+            state.setdefault("video_errors", {}).pop(video_key, None)
             # Recalculate counters from CSV instead of incrementing in memory;
             # the CSV is the durable record of generated rows.
             _sync_phase2_state_from_output_csv(
@@ -1590,8 +1659,15 @@ def augment_dataset(
             delete_temp_video(local_video_path, verbose=False)
             return True, None
 
-        except Exception:
+        except Exception as error:
             state["videos"][video_key] = PHASE2_VIDEO_STATE_FAILED
+            state.setdefault("video_errors", {})[video_key] = {
+                "patient_id": patient_id,
+                "video_filename": video_filename,
+                "error_type": type(error).__name__,
+                "message": str(error),
+                "traceback": traceback.format_exc(),
+            }
             _save_phase2_state(state, state_path)
             return False, local_video_path
 
@@ -1751,4 +1827,5 @@ def augment_dataset(
         "rows_output": len(output_df),
         "output_csv_path": str(output_csv_path),
         "state_json_path": str(state_path),
+        **original_sync_summary,
     }

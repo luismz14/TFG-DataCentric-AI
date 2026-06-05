@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pandas as pd
 
 import src.ModelTrain as ModelTrain
@@ -9,12 +12,13 @@ from src.baseline_config import BASELINE_CONFIG
 from src.experiment_reporting import print_experiment_summary
 from src.experiment_runner import run_training_experiments
 from src.phase2.config import (
+    PHASE2_CONFIDENCE_ONLY_FRAMES_DIR,
+    PHASE2_CONFIDENCE_ONLY_THRESHOLD,
     PHASE2_DATASET_INVENTORY,
     PHASE2_FRAMES_DIR,
     PHASE2_FULL_TRAIN_CSV,
     PHASE2_HALF_PRECISION,
     PHASE2_IMAGE_SIZE,
-    PHASE2_CONFIDENCE_ONLY_THRESHOLD,
     PHASE2_KINF_CONFIDENCE_THRESHOLD,
     PHASE2_MAX_CANDIDATES_PER_VIDEO,
     PHASE2_MAX_PREFETCH_VIDEOS,
@@ -42,19 +46,48 @@ def phase2_confidence_only_csv_path(confidence_threshold: float) -> Path:
     )
 
 
+def _phase2_confidence_tag(confidence_threshold: float) -> str:
+    return f"conf{int(round(float(confidence_threshold) * 100)):03d}"
+
+
+def phase2_confidence_only_runs(
+    confidence_threshold: float = PHASE2_CONFIDENCE_ONLY_THRESHOLD,
+) -> list[dict]:
+    confidence_tag = _phase2_confidence_tag(confidence_threshold)
+    return [
+        {
+            **run,
+            "results_dir": Path(run["results_dir"]).parent
+            / confidence_tag
+            / Path(run["results_dir"]).name,
+        }
+        for run in PHASE2_RUNS
+    ]
+
+
 def ingest_phase2_dataset(
     confidence_threshold: float | None = None,
+    frames_dir: str | Path | None = None,
 ) -> dict[str, int | str | bool | float]:
     output_csv_path = (
         phase2_confidence_only_csv_path(confidence_threshold)
         if confidence_threshold is not None
         else PHASE2_FULL_TRAIN_CSV
     )
+    output_frames_dir = (
+        Path(frames_dir)
+        if frames_dir is not None
+        else (
+            PHASE2_CONFIDENCE_ONLY_FRAMES_DIR
+            if confidence_threshold is not None
+            else PHASE2_FRAMES_DIR
+        )
+    )
     summary = augment_dataset(
         yolo_weights_path=PHASE2_YOLO_WEIGHTS,
         metadata_csv_path=resolve_data_path(PHASE2_SOURCE_CSV),
         dataset_inventory_path=resolve_data_path(PHASE2_DATASET_INVENTORY),
-        output_dir=resolve_data_path(PHASE2_FRAMES_DIR),
+        output_dir=resolve_data_path(output_frames_dir),
         output_csv_path=resolve_data_path(output_csv_path),
         max_candidates_per_video=PHASE2_MAX_CANDIDATES_PER_VIDEO,
         target_fps=PHASE2_TARGET_FPS,
@@ -70,13 +103,18 @@ def ingest_phase2_dataset(
         "none" if confidence_threshold is None else float(confidence_threshold)
     )
     summary["use_histology_candidate_limits"] = confidence_threshold is None
+    summary["frames_dir"] = str(resolve_data_path(output_frames_dir))
     return summary
 
 
 def ingest_phase2_confidence_only_dataset(
     confidence_threshold: float = PHASE2_CONFIDENCE_ONLY_THRESHOLD,
+    frames_dir: str | Path = PHASE2_CONFIDENCE_ONLY_FRAMES_DIR,
 ) -> dict[str, int | str | bool | float]:
-    return ingest_phase2_dataset(confidence_threshold=confidence_threshold)
+    return ingest_phase2_dataset(
+        confidence_threshold=confidence_threshold,
+        frames_dir=frames_dir,
+    )
 
 
 def curate_phase2_kinf_dataset() -> dict[str, int | str | float]:
@@ -120,14 +158,14 @@ def curate_phase2_kinf_dataset() -> dict[str, int | str | float]:
     }
 
 
-def print_phase2_train_summary() -> None:
-    train_df = read_csv(resolve_data_path(PHASE2_TRAIN_CSV))
+def print_phase2_train_summary(train_csv: str | Path = PHASE2_TRAIN_CSV) -> None:
+    train_df = read_csv(resolve_data_path(train_csv))
     print(train_df["histology"].value_counts().to_string())
     print(f"total: {len(train_df)}")
 
 
-def print_phase2_detection_summary() -> None:
-    train_df = read_csv(resolve_data_path(PHASE2_TRAIN_CSV))
+def print_phase2_detection_summary(train_csv: str | Path = PHASE2_TRAIN_CSV) -> None:
+    train_df = read_csv(resolve_data_path(train_csv))
     train_df = train_df.copy()
     train_df["detection_confidence"] = train_df["detection_confidence"].fillna(0.0)
     train_df["has_annotation"] = train_df["detection_confidence"].gt(0)
@@ -174,6 +212,52 @@ def print_phase2_detection_summary() -> None:
     print(output.to_string(index=False))
 
 
+def phase2_failure_summary(
+    output_csv_path: str | Path = PHASE2_TRAIN_CSV,
+) -> pd.DataFrame:
+    state_path = resolve_data_path(output_csv_path).with_suffix(".json")
+    if not state_path.exists():
+        return pd.DataFrame(
+            columns=[
+                "video_key",
+                "status",
+                "error_type",
+                "message",
+                "traceback_tail",
+            ]
+        )
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    videos = state.get("videos", {})
+    video_errors = state.get("video_errors", {})
+
+    rows = []
+    for video_key, status in videos.items():
+        if status != "failed":
+            continue
+
+        error = video_errors.get(video_key, {})
+        traceback_text = str(error.get("traceback", "")).strip()
+        traceback_lines = traceback_text.splitlines()
+        rows.append(
+            {
+                "video_key": video_key,
+                "status": status,
+                "error_type": error.get("error_type", "unknown"),
+                "message": error.get("message", ""),
+                "traceback_tail": "\n".join(traceback_lines[-6:]),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def print_phase2_failure_summary(
+    output_csv_path: str | Path = PHASE2_TRAIN_CSV,
+) -> pd.DataFrame:
+    return phase2_failure_summary(output_csv_path=output_csv_path)
+
+
 def _results_dirs_for_config(
     training_config: ModelTrain.TrainingConfig,
 ) -> list[dict]:
@@ -202,11 +286,38 @@ def run_phase2_experiments(
     )
 
 
+def run_phase2_confidence_only_experiments(
+    force_train: bool = False,
+    training_config: ModelTrain.TrainingConfig = BASELINE_CONFIG,
+    confidence_threshold: float = PHASE2_CONFIDENCE_ONLY_THRESHOLD,
+    train_images_dir: str | Path = PHASE2_CONFIDENCE_ONLY_FRAMES_DIR,
+) -> None:
+    run_training_experiments(
+        runs=phase2_confidence_only_runs(confidence_threshold),
+        train_csv=phase2_confidence_only_csv_path(confidence_threshold),
+        train_images_dir=train_images_dir,
+        base_config=training_config,
+        force_train=force_train,
+    )
+
+
 def show_phase2_plots(
     training_config: ModelTrain.TrainingConfig = BASELINE_CONFIG,
 ) -> None:
     for run in _results_dirs_for_config(training_config):
         show_training_plots(run["results_dir"])
+
+
+def show_phase2_confidence_only_plots(
+    training_config: ModelTrain.TrainingConfig = BASELINE_CONFIG,
+    confidence_threshold: float = PHASE2_CONFIDENCE_ONLY_THRESHOLD,
+) -> None:
+    for run in phase2_confidence_only_runs(confidence_threshold):
+        results_dir = with_architecture_results_dir(
+            training_config.architecture,
+            run["results_dir"],
+        )
+        show_training_plots(results_dir)
 
 
 def print_phase2_summary(
@@ -216,4 +327,16 @@ def print_phase2_summary(
         results_dirs=[run["results_dir"] for run in PHASE2_RUNS],
         training_config=training_config,
         random_states=[run["random_state"] for run in PHASE2_RUNS],
+    )
+
+
+def print_phase2_confidence_only_summary(
+    training_config: ModelTrain.TrainingConfig = BASELINE_CONFIG,
+    confidence_threshold: float = PHASE2_CONFIDENCE_ONLY_THRESHOLD,
+) -> pd.DataFrame:
+    runs = phase2_confidence_only_runs(confidence_threshold)
+    return print_experiment_summary(
+        results_dirs=[run["results_dir"] for run in runs],
+        training_config=training_config,
+        random_states=[run["random_state"] for run in runs],
     )
