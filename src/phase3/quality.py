@@ -26,6 +26,7 @@ def normalize_enabled_filters(enabled_filters: tuple[str, ...]) -> tuple[str, ..
 
 def run_phase3_quality_filters(
     input_csv: str | Path,
+    images_dir: str | Path = PHASE3_IMAGES_DIR,
     enabled_filters: tuple[str, ...] = ("darkness", "uniformity", "blur"),
     params: Filter.FilterParams = PHASE3_FILTER_PARAMS,
     output_csv: str | Path | None = None,
@@ -40,7 +41,7 @@ def run_phase3_quality_filters(
         params=params,
         dataframe_or_csv=resolve_data_path(input_csv),
         enabled_filters=enabled_filters,
-        images_dir=resolve_data_path(PHASE3_IMAGES_DIR),
+        images_dir=resolve_data_path(images_dir),
     )
     write_csv(filtered_df, output_csv_path)
 

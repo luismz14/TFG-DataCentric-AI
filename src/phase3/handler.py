@@ -26,9 +26,10 @@ from utils.phase3.deduplication import calculate_phase3_metrics
 def run_phase3_processing(
     steps: Mapping[str, bool],
     input_csv: str | Path = PHASE3_SOURCE_CSV,
+    images_dir: str | Path = PHASE3_IMAGES_DIR,
     params: Filter.FilterParams = PHASE3_FILTER_PARAMS,
     ssim_threshold: float = 0.75,
-    phash_distance_threshold: int = 8,
+    phash_distance_threshold: float = 8,
 ) -> dict[str, object]:
     resolved_steps = normalize_phase3_steps(steps)
     descriptor = descriptor_from_steps(
@@ -55,6 +56,7 @@ def run_phase3_processing(
         dedup_output_csv = output_csv if not enabled_filters else None
         deduplication_result = run_phase3_deduplication(
             input_csv=current_csv,
+            images_dir=images_dir,
             ssim_threshold=ssim_threshold,
             phash_distance_threshold=phash_distance_threshold,
             output_csv=dedup_output_csv,
@@ -65,6 +67,7 @@ def run_phase3_processing(
     if enabled_filters:
         filtering_result = run_phase3_quality_filters(
             input_csv=current_csv,
+            images_dir=images_dir,
             enabled_filters=enabled_filters,
             params=params,
             output_csv=output_csv,
@@ -75,7 +78,7 @@ def run_phase3_processing(
     if not resolved_steps["deduplication"] and not enabled_filters:
         dataframe = calculate_phase3_metrics(
             dataframe_or_csv=resolve_data_path(input_csv),
-            images_dir=resolve_data_path(PHASE3_IMAGES_DIR),
+            images_dir=resolve_data_path(images_dir),
         )
         write_csv(dataframe, resolve_data_path(output_csv))
         current_csv = output_csv

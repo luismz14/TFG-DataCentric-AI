@@ -26,7 +26,7 @@ def run_deduplication_pipeline(
     output_path: str | Path | None = None,
     top_k_by_histology: dict[str, int] | None = None,
     ssim_threshold: float = SSIM_THRESHOLD,
-    phash_distance_threshold: int = PHASH_DISTANCE_THRESHOLD,
+    phash_distance_threshold: float = PHASH_DISTANCE_THRESHOLD,
 ) -> dict[str, object]:
     """
     Run the complete deduplication pipeline from a metadata table.
@@ -137,7 +137,7 @@ def deduplication_handler(
     output_path: str | Path | None = None,
     top_k_by_histology: dict[str, int] | None = None,
     ssim_threshold: float = SSIM_THRESHOLD,
-    phash_distance_threshold: int = PHASH_DISTANCE_THRESHOLD,
+    phash_distance_threshold: float = PHASH_DISTANCE_THRESHOLD,
 ) -> dict[str, object]:
     """
     Run the visual deduplication pipeline from a metadata table.
@@ -353,7 +353,7 @@ def calculate_similarity_pairs_for_group(
     group_df: pd.DataFrame,
     images_dir: str | Path,
     ssim_threshold: float = SSIM_THRESHOLD,
-    phash_distance_threshold: int = PHASH_DISTANCE_THRESHOLD,
+    phash_distance_threshold: float = PHASH_DISTANCE_THRESHOLD,
     output_size: tuple[int, int] = SIMILARITY_SIZE,
 ) -> pd.DataFrame:
     """
@@ -449,7 +449,7 @@ def calculate_similarity(
     dataframe: pd.DataFrame,
     images_dir: str | Path,
     ssim_threshold: float = SSIM_THRESHOLD,
-    phash_distance_threshold: int = PHASH_DISTANCE_THRESHOLD,
+    phash_distance_threshold: float = PHASH_DISTANCE_THRESHOLD,
     output_size: tuple[int, int] = SIMILARITY_SIZE,
 ) -> pd.DataFrame:
     """

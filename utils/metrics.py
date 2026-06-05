@@ -240,3 +240,53 @@ def print_results_metrics_summary(
         )
 
     return _summarize_per_run_metrics(per_run_metrics)
+
+
+def collect_results_metrics(
+    results_dirs: Sequence[str | Path],
+    validation_csv_dir: str | Path,
+    validation_img_dir: str | Path,
+    training_config: ModelTrain.TrainingConfig,
+    random_states: Sequence[int] | None = None,
+) -> pd.DataFrame:
+    if not results_dirs:
+        raise ValueError("`results_dirs` cannot be empty.")
+
+    resolved_random_states = _resolve_random_states(
+        results_dirs=results_dirs,
+        base_config=training_config,
+        random_states=random_states,
+    )
+
+    per_run_metrics: list[dict[str, float | str]] = []
+    for results_dir, random_state in zip(results_dirs, resolved_random_states):
+        config = _clone_config(training_config)
+        config.random_state = random_state
+        per_run_metrics.append(
+            _evaluate_results_dir(
+                results_dir=results_dir,
+                validation_csv_dir=validation_csv_dir,
+                validation_img_dir=validation_img_dir,
+                config=config,
+            )
+        )
+
+    return pd.DataFrame(per_run_metrics)
+
+
+def summarize_general_results_metrics(per_run_metrics: pd.DataFrame) -> dict[str, float]:
+    if per_run_metrics.empty:
+        raise ValueError("`per_run_metrics` cannot be empty.")
+
+    summary = {}
+    for metric_name in SUMMARY_COLUMNS:
+        key = _metric_key("general", metric_name)
+        if key not in per_run_metrics.columns:
+            raise ValueError(f"Missing metric column: {key}")
+        values = pd.to_numeric(per_run_metrics[key], errors="raise")
+        summary[metric_name] = float(values.mean())
+        summary[f"{metric_name}_std"] = (
+            float(values.std(ddof=1)) if len(values) > 1 else float("nan")
+        )
+
+    return summary

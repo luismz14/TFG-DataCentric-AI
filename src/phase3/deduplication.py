@@ -15,11 +15,12 @@ from utils.phase3.deduplication import calculate_phase3_metrics
 
 def calculate_phase3_source_metrics(
     input_csv: str | Path = PHASE3_SOURCE_CSV,
+    images_dir: str | Path = PHASE3_IMAGES_DIR,
     output_csv: str | Path | None = None,
 ) -> pd.DataFrame:
     metrics_df = calculate_phase3_metrics(
         dataframe_or_csv=resolve_data_path(input_csv),
-        images_dir=resolve_data_path(PHASE3_IMAGES_DIR),
+        images_dir=resolve_data_path(images_dir),
     )
     if output_csv is not None:
         write_csv(metrics_df, resolve_data_path(output_csv))
@@ -28,8 +29,9 @@ def calculate_phase3_source_metrics(
 
 def run_phase3_deduplication(
     input_csv: str | Path = PHASE3_SOURCE_CSV,
+    images_dir: str | Path = PHASE3_IMAGES_DIR,
     ssim_threshold: float = 0.75,
-    phash_distance_threshold: int = 8,
+    phash_distance_threshold: float = 8,
     output_csv: str | Path | None = None,
     descriptor: str | None = None,
 ) -> dict[str, object]:
@@ -39,7 +41,7 @@ def run_phase3_deduplication(
 
     metrics_df = calculate_phase3_metrics(
         dataframe_or_csv=resolve_data_path(input_csv),
-        images_dir=resolve_data_path(PHASE3_IMAGES_DIR),
+        images_dir=resolve_data_path(images_dir),
     )
     metrics_input_path = output_csv_path.with_name(
         f"{output_csv_path.stem}_metrics.csv"
@@ -48,7 +50,7 @@ def run_phase3_deduplication(
 
     result = TemporaryClean.deduplication_handler(
         metadata_path=metrics_input_path,
-        images_dir=resolve_data_path(PHASE3_IMAGES_DIR),
+        images_dir=resolve_data_path(images_dir),
         output_path=output_csv_path,
         ssim_threshold=ssim_threshold,
         phash_distance_threshold=phash_distance_threshold,
