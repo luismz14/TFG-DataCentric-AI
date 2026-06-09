@@ -44,6 +44,7 @@ from utils.metrics import (
     summarize_general_results_metrics,
 )
 from utils.phase3.deduplication import calculate_phase3_metrics
+from utils.plot import show_training_plots
 
 
 DedupMode = Literal["config", "p90_10", "p75_25"]
@@ -631,6 +632,29 @@ def print_phase3_summary(
     )
 
 
+def show_phase3_plots(
+    train_csv: str | Path,
+    descriptor: str | None = None,
+    training_config: ModelTrain.TrainingConfig = BASELINE_CONFIG,
+    runs: Sequence[dict] = PHASE3_TEST_RUNS,
+    results_root: str | Path = PHASE3_TEST_RESULTS_ROOT,
+) -> None:
+    train_csv = _csv_relative_to_data(train_csv)
+    descriptor = descriptor or Path(train_csv).stem.removeprefix("phase3_")
+    experiment_runs = _runs_for_descriptor(
+        descriptor,
+        runs=runs,
+        results_root=results_root,
+    )
+    for run in experiment_runs:
+        show_training_plots(
+            with_architecture_results_dir(
+                training_config.architecture,
+                run["results_dir"],
+            )
+        )
+
+
 def run_phase3_experiment(
     spec: Phase3ExperimentSpec,
     force_rebuild_dataset: bool = False,
@@ -741,10 +765,16 @@ def print_phase3_test_summary(
     train_csv: str | Path,
     descriptor: str | None = None,
     training_config: ModelTrain.TrainingConfig = BASELINE_CONFIG,
+    runs: Sequence[dict] = PHASE3_TEST_RUNS,
+    results_root: str | Path = PHASE3_TEST_RESULTS_ROOT,
 ) -> pd.DataFrame:
     train_csv = _csv_relative_to_data(train_csv)
     descriptor = descriptor or Path(train_csv).stem.removeprefix("phase3_")
-    experiment_runs = _runs_for_descriptor(descriptor)
+    experiment_runs = _runs_for_descriptor(
+        descriptor,
+        runs=runs,
+        results_root=results_root,
+    )
     return print_results_metrics_summary(
         results_dirs=[run["results_dir"] for run in experiment_runs],
         validation_csv_dir="test/external_test.csv",
@@ -779,6 +809,7 @@ __all__ = [
     "run_phase3_experiment",
     "train_phase3_dataset",
     "print_phase3_summary",
+    "show_phase3_plots",
     "summarize_phase3_experiment_specs",
     "select_best_phase3_spec",
     "select_best_phase3_individual_options",

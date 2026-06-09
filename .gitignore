@@ -61,3 +61,5 @@ reports/
 advisor_reruns_student/
 data/test/images_cropped/
 data/phase2/frames_confidence_only
+results/EfficientNet/phase3_test
+data/phase3test
