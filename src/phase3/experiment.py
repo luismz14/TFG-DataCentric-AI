@@ -51,8 +51,8 @@ DedupMode = Literal["config", "p90_10", "p75_25"]
 QualityMode = Literal["config", "p10", "p25"]
 Operation = Literal["top", "dedup", "quality"]
 
-PHASE3_TEST_RESULTS_ROOT = Path("phase3_test")
-PHASE3_TEST_DATA_DIR = Path("phase3test")
+PHASE3_TEST_RESULTS_ROOT = Path("phase3")
+PHASE3_TEST_DATA_DIR = Path("phase3")
 PHASE3_TEST_RUNS = PHASE3_RUNS[:2]
 PHASE3_TOP_FRACTIONS = (0.60, 0.70, 0.80)
 PHASE3_DEDUP_MODES: tuple[DedupMode, ...] = ("config", "p90_10", "p75_25")
@@ -587,6 +587,26 @@ def build_phase3_all_experiment_specs(
     ]
 
 
+def phase3_final_experiment_specs() -> tuple[Phase3ExperimentSpec, ...]:
+    sources = {source.name: source for source in phase3_source_specs()}
+    return (
+        Phase3ExperimentSpec(
+            source=sources["conf060"],
+            operations=("dedup",),
+            descriptor="conf060_dedup_p75_25",
+            output_csv=PHASE3_TEST_DATA_DIR / "phase3_conf060_dedup_p75_25.csv",
+            dedup_mode="p75_25",
+        ),
+        Phase3ExperimentSpec(
+            source=sources["kinf"],
+            operations=("dedup",),
+            descriptor="kinf_dedup_p75_25",
+            output_csv=PHASE3_TEST_DATA_DIR / "phase3_kinf_dedup_p75_25.csv",
+            dedup_mode="p75_25",
+        ),
+    )
+
+
 def train_phase3_dataset(
     train_csv: str | Path,
     force_train: bool = False,
@@ -685,10 +705,16 @@ def run_phase3_experiment(
 def summarize_phase3_experiment_specs(
     specs: Sequence[Phase3ExperimentSpec],
     training_config: ModelTrain.TrainingConfig = BASELINE_CONFIG,
+    runs: Sequence[dict] = PHASE3_TEST_RUNS,
+    results_root: str | Path = PHASE3_TEST_RESULTS_ROOT,
 ) -> pd.DataFrame:
     rows = []
     for spec in specs:
-        experiment_runs = _runs_for_descriptor(spec.descriptor)
+        experiment_runs = _runs_for_descriptor(
+            spec.descriptor,
+            runs=runs,
+            results_root=results_root,
+        )
         per_run_metrics = collect_results_metrics(
             results_dirs=[run["results_dir"] for run in experiment_runs],
             validation_csv_dir=VALIDATION_CSV,
@@ -706,7 +732,11 @@ def summarize_phase3_experiment_specs(
                 "dedup_mode": spec.dedup_mode,
                 "quality_mode": spec.quality_mode,
                 "output_csv": str(spec.output_csv),
-                **general_summary,
+                "macro_f1": general_summary["macro_f1"],
+                "mcc": general_summary["mcc"],
+                "accuracy": general_summary["accuracy"],
+                "precision": general_summary["precision"],
+                "recall": general_summary["recall"],
             }
         )
 
@@ -806,6 +836,7 @@ __all__ = [
     "build_phase3_individual_experiment_specs",
     "build_phase3_combined_experiment_specs",
     "build_phase3_all_experiment_specs",
+    "phase3_final_experiment_specs",
     "run_phase3_experiment",
     "train_phase3_dataset",
     "print_phase3_summary",

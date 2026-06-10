@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 from pathlib import Path
+from typing import Sequence
 
 import pandas as pd
 
@@ -30,7 +32,17 @@ from src.phase2.config import (
     PHASE2_YOLO_WEIGHTS,
 )
 from utils.common import read_csv, resolve_data_path
+from utils.constants import VALIDATION_CSV, VALIDATION_IMAGES_DIR
+from utils.metrics import collect_results_metrics, summarize_general_results_metrics
 from utils.plot import show_training_plots
+
+
+@dataclass(frozen=True, slots=True)
+class Phase2ExperimentSpec:
+    descriptor: str
+    train_csv: Path
+    images_dir: Path
+    results_dir: Path
 
 
 def print_phase2_source_summary() -> None:
@@ -62,6 +74,43 @@ def phase2_confidence_only_runs(
             / Path(run["results_dir"]).name,
         }
         for run in PHASE2_RUNS
+    ]
+
+
+def phase2_comparison_specs() -> tuple[Phase2ExperimentSpec, ...]:
+    return (
+        Phase2ExperimentSpec(
+            descriptor="train",
+            train_csv=PHASE2_FULL_TRAIN_CSV,
+            images_dir=PHASE2_FRAMES_DIR,
+            results_dir=Path("phase2") / "train",
+        ),
+        Phase2ExperimentSpec(
+            descriptor="kinf",
+            train_csv=PHASE2_TRAIN_CSV,
+            images_dir=PHASE2_FRAMES_DIR,
+            results_dir=Path("phase2") / "kinf",
+        ),
+        Phase2ExperimentSpec(
+            descriptor=_phase2_confidence_tag(PHASE2_CONFIDENCE_ONLY_THRESHOLD),
+            train_csv=phase2_confidence_only_csv_path(PHASE2_CONFIDENCE_ONLY_THRESHOLD),
+            images_dir=PHASE2_CONFIDENCE_ONLY_FRAMES_DIR,
+            results_dir=Path("phase2")
+            / _phase2_confidence_tag(PHASE2_CONFIDENCE_ONLY_THRESHOLD),
+        ),
+    )
+
+
+def phase2_runs_for_spec(
+    spec: Phase2ExperimentSpec,
+    runs: Sequence[dict] = PHASE2_RUNS,
+) -> list[dict]:
+    return [
+        {
+            "results_dir": spec.results_dir / Path(run["results_dir"]).name,
+            "random_state": run["random_state"],
+        }
+        for run in runs
     ]
 
 
@@ -298,6 +347,58 @@ def run_phase2_confidence_only_experiments(
         train_images_dir=train_images_dir,
         base_config=training_config,
         force_train=force_train,
+    )
+
+
+def train_phase2_dataset(
+    spec: Phase2ExperimentSpec,
+    force_train: bool = False,
+    training_config: ModelTrain.TrainingConfig = BASELINE_CONFIG,
+    runs: Sequence[dict] = PHASE2_RUNS,
+) -> str:
+    run_training_experiments(
+        runs=phase2_runs_for_spec(spec, runs=runs),
+        train_csv=spec.train_csv,
+        train_images_dir=spec.images_dir,
+        base_config=training_config,
+        force_train=force_train,
+    )
+    return spec.descriptor
+
+
+def summarize_phase2_experiment_specs(
+    specs: Sequence[Phase2ExperimentSpec],
+    training_config: ModelTrain.TrainingConfig = BASELINE_CONFIG,
+    runs: Sequence[dict] = PHASE2_RUNS,
+) -> pd.DataFrame:
+    rows = []
+    for spec in specs:
+        experiment_runs = phase2_runs_for_spec(spec, runs=runs)
+        per_run_metrics = collect_results_metrics(
+            results_dirs=[run["results_dir"] for run in experiment_runs],
+            validation_csv_dir=VALIDATION_CSV,
+            validation_img_dir=VALIDATION_IMAGES_DIR,
+            training_config=training_config,
+            random_states=[run["random_state"] for run in experiment_runs],
+        )
+        general_summary = summarize_general_results_metrics(per_run_metrics)
+        rows.append(
+            {
+                "descriptor": spec.descriptor,
+                "train_csv": str(spec.train_csv),
+                "images_dir": str(spec.images_dir),
+                "macro_f1": general_summary["macro_f1"],
+                "mcc": general_summary["mcc"],
+                "accuracy": general_summary["accuracy"],
+                "precision": general_summary["precision"],
+                "recall": general_summary["recall"],
+            }
+        )
+
+    return (
+        pd.DataFrame(rows)
+        .sort_values(["macro_f1", "mcc"], ascending=[False, False])
+        .reset_index(drop=True)
     )
 
 
