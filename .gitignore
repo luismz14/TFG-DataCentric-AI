@@ -55,7 +55,7 @@ utils/Informe_final_ejemplo.pdf
 # Logs
 *.log
 
-data/test/external_test_images/
+data/test/external_tesT/
 data/images_cropped/
 reports/
 advisor_reruns_student/

@@ -21,12 +21,12 @@ from src.phase2.config import (
     PHASE2_FULL_TRAIN_CSV,
     PHASE2_HALF_PRECISION,
     PHASE2_IMAGE_SIZE,
-    PHASE2_KINF_CONFIDENCE_THRESHOLD,
     PHASE2_MAX_CANDIDATES_PER_VIDEO,
     PHASE2_MAX_PREFETCH_VIDEOS,
     PHASE2_RUNS,
     PHASE2_SOURCE_CSV,
     PHASE2_TARGET_FPS,
+    PHASE2_TRAIN_CONF040_THRESHOLD,
     PHASE2_TRAIN_CSV,
     PHASE2_WINDOW_SEC,
     PHASE2_YOLO_WEIGHTS,
@@ -86,10 +86,10 @@ def phase2_comparison_specs() -> tuple[Phase2ExperimentSpec, ...]:
             results_dir=Path("phase2") / "train",
         ),
         Phase2ExperimentSpec(
-            descriptor="kinf",
+            descriptor="train_conf040",
             train_csv=PHASE2_TRAIN_CSV,
             images_dir=PHASE2_FRAMES_DIR,
-            results_dir=Path("phase2") / "kinf",
+            results_dir=Path("phase2") / "train_conf040",
         ),
         Phase2ExperimentSpec(
             descriptor=_phase2_confidence_tag(PHASE2_CONFIDENCE_ONLY_THRESHOLD),
@@ -166,7 +166,7 @@ def ingest_phase2_confidence_only_dataset(
     )
 
 
-def curate_phase2_kinf_dataset() -> dict[str, int | str | float]:
+def curate_phase2_train_conf040_dataset() -> dict[str, int | str | float]:
     """Create the selected phase-2 dataset: originals + conf>=0.40 video frames."""
     source_path = resolve_data_path(PHASE2_FULL_TRAIN_CSV)
     output_path = resolve_data_path(PHASE2_TRAIN_CSV)
@@ -176,7 +176,7 @@ def curate_phase2_kinf_dataset() -> dict[str, int | str | float]:
     missing_columns = required_columns - set(train_df.columns)
     if missing_columns:
         raise ValueError(
-            f"Cannot curate phase-2 K=all dataset; missing columns: "
+            f"Cannot curate phase-2 train_conf040 dataset; missing columns: "
             f"{sorted(missing_columns)}"
         )
 
@@ -187,7 +187,7 @@ def curate_phase2_kinf_dataset() -> dict[str, int | str | float]:
     original_mask = train_df["source_type"].eq("original")
     video_mask = (
         train_df["source_type"].eq("video_candidate")
-        & train_df["detection_confidence"].ge(PHASE2_KINF_CONFIDENCE_THRESHOLD)
+        & train_df["detection_confidence"].ge(PHASE2_TRAIN_CONF040_THRESHOLD)
     )
     curated_df = train_df.loc[original_mask | video_mask].reset_index(drop=True)
 
@@ -197,7 +197,7 @@ def curate_phase2_kinf_dataset() -> dict[str, int | str | float]:
     return {
         "source_csv_path": str(source_path),
         "output_csv_path": str(output_path),
-        "confidence_threshold": PHASE2_KINF_CONFIDENCE_THRESHOLD,
+        "confidence_threshold": PHASE2_TRAIN_CONF040_THRESHOLD,
         "total_rows": len(curated_df),
         "original_rows": int(original_mask.sum()),
         "video_rows": int(video_mask.sum()),

@@ -80,7 +80,7 @@ class Phase3ExperimentSpec:
 def phase3_source_specs() -> tuple[Phase3SourceSpec, ...]:
     return (
         Phase3SourceSpec(
-            name="kinf",
+            name="train_conf040",
             csv=PHASE2_TRAIN_CSV,
             images_dir=PHASE2_FRAMES_DIR,
         ),
@@ -598,10 +598,10 @@ def phase3_final_experiment_specs() -> tuple[Phase3ExperimentSpec, ...]:
             dedup_mode="p75_25",
         ),
         Phase3ExperimentSpec(
-            source=sources["kinf"],
+            source=sources["train_conf040"],
             operations=("dedup",),
-            descriptor="kinf_dedup_p75_25",
-            output_csv=PHASE3_TEST_DATA_DIR / "phase3_kinf_dedup_p75_25.csv",
+            descriptor="train_conf040_dedup_p75_25",
+            output_csv=PHASE3_TEST_DATA_DIR / "phase3_train_conf040_dedup_p75_25.csv",
             dedup_mode="p75_25",
         ),
     )
