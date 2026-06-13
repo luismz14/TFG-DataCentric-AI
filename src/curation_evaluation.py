@@ -128,6 +128,7 @@ def run_phase3_experiment(
     force_score: bool = False,
     force_train: bool = False,
     training_config: training.TrainingConfig = BASELINE_CONFIG,
+    results_root: str | Path = PHASE3_EVALUATION_RESULTS_ROOT,
 ) -> pd.DataFrame:
     dataset_result = prepare_phase3_experiment_dataset(
         spec,
@@ -139,12 +140,14 @@ def run_phase3_experiment(
         descriptor=spec.descriptor,
         training_config=training_config,
         force_train=force_train,
+        results_root=results_root,
         train_images_dir=spec.source.images_dir,
     )
     return print_phase3_summary(
         train_csv=dataset_result["output_csv"],
         descriptor=spec.descriptor,
         training_config=training_config,
+        results_root=results_root,
     )
 
 
