@@ -7,14 +7,14 @@ from typing import Sequence
 
 import pandas as pd
 
-import src.ModelTrain as ModelTrain
+import src.training as training
 from utils.constants import VALIDATION_CSV, VALIDATION_IMAGES_DIR
 from utils.metrics import print_results_metrics_summary
 
 
 def print_experiment_summary(
     results_dirs: Sequence[str | Path],
-    training_config: ModelTrain.TrainingConfig,
+    training_config: training.TrainingConfig,
     random_states: Sequence[int] | None = None,
 ) -> pd.DataFrame:
     return print_results_metrics_summary(

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-import src.ModelTrain as ModelTrain
+import src.training as training
 from src.architecture import with_architecture_results_dir
 from src.baseline_config import BASELINE_CONFIG
 from src.experiment_reporting import print_experiment_summary
@@ -14,7 +14,7 @@ from utils.plot import show_training_plots
 
 
 def _results_dirs_for_config(
-    training_config: ModelTrain.TrainingConfig,
+    training_config: training.TrainingConfig,
 ) -> list[dict]:
     return [
         {
@@ -30,7 +30,7 @@ def _results_dirs_for_config(
 
 def run_phase1_experiments(
     force_train: bool = False,
-    training_config: ModelTrain.TrainingConfig = BASELINE_CONFIG,
+    training_config: training.TrainingConfig = BASELINE_CONFIG,
 ) -> None:
     run_training_experiments(
         runs=PHASE1_RUNS,
@@ -42,14 +42,14 @@ def run_phase1_experiments(
 
 
 def show_phase1_plots(
-    training_config: ModelTrain.TrainingConfig = BASELINE_CONFIG,
+    training_config: training.TrainingConfig = BASELINE_CONFIG,
 ) -> None:
     for run in _results_dirs_for_config(training_config):
         show_training_plots(run["results_dir"])
 
 
 def print_phase1_summary(
-    training_config: ModelTrain.TrainingConfig = BASELINE_CONFIG,
+    training_config: training.TrainingConfig = BASELINE_CONFIG,
 ) -> pd.DataFrame:
     return print_experiment_summary(
         results_dirs=[run["results_dir"] for run in PHASE1_RUNS],

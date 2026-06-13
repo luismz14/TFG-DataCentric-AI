@@ -3,15 +3,12 @@ import json
 import math
 import os
 import shutil
-import sys
 import traceback
 import uuid
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
-
-sys.path.append("..")
 
 import cv2
 import pandas as pd

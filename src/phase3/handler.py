@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from pathlib import Path
 
-import src.Filters as Filter
+import src.quality_filters as quality_filters
 from src.phase3.config import (
     PHASE3_DATA_DIR,
     PHASE3_FILTER_PARAMS,
@@ -20,14 +20,14 @@ from src.phase3.naming import (
 )
 from src.phase3.quality import normalize_enabled_filters, run_phase3_quality_filters
 from utils.common import resolve_data_path, write_csv
-from utils.phase3.deduplication import calculate_phase3_metrics
+from src.phase3.metrics import calculate_phase3_metrics
 
 
 def run_phase3_processing(
     steps: Mapping[str, bool],
     input_csv: str | Path = PHASE3_SOURCE_CSV,
     images_dir: str | Path = PHASE3_IMAGES_DIR,
-    params: Filter.FilterParams = PHASE3_FILTER_PARAMS,
+    params: quality_filters.FilterParams = PHASE3_FILTER_PARAMS,
     ssim_threshold: float = 0.75,
     phash_distance_threshold: float = 8,
 ) -> dict[str, object]:

@@ -4,9 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pandas as pd
-
-import src.Filters as Filter
+import src.quality_filters as quality_filters
 from src.phase3.config import (
     PHASE3_DATA_DIR,
     PHASE3_FILTER_PARAMS,
@@ -14,7 +12,7 @@ from src.phase3.config import (
 )
 from src.phase3.naming import filtered_descriptor, phase3_csv_path
 from utils.common import resolve_data_path, write_csv
-from utils.phase3.quality import FILTER_ORDER, apply_quality_filters
+from src.phase3.filtering import FILTER_ORDER, apply_quality_filters
 
 
 def normalize_enabled_filters(enabled_filters: tuple[str, ...]) -> tuple[str, ...]:
@@ -28,7 +26,7 @@ def run_phase3_quality_filters(
     input_csv: str | Path,
     images_dir: str | Path = PHASE3_IMAGES_DIR,
     enabled_filters: tuple[str, ...] = ("darkness", "uniformity", "blur"),
-    params: Filter.FilterParams = PHASE3_FILTER_PARAMS,
+    params: quality_filters.FilterParams = PHASE3_FILTER_PARAMS,
     output_csv: str | Path | None = None,
     descriptor: str | None = None,
 ) -> dict[str, object]:

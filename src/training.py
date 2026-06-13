@@ -29,7 +29,7 @@ from torchvision import transforms
 from tqdm import tqdm
 
 from src.architecture import EFFICIENTNET_B0
-from .PolypClassifier import PolypClassifier
+from .polyp_classifier import PolypClassifier
 from utils.common import (
     RESULTS_DIR,
     read_csv,

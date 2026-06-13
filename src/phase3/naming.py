@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from collections.abc import Mapping
 
-import src.Filters as Filter
+import src.quality_filters as quality_filters
 
 
 def format_threshold(value: float | int) -> str:
@@ -23,7 +23,7 @@ def deduplication_tag(ssim_threshold: float, phash_distance_threshold: int) -> s
 
 def filter_tag(
     enabled_filters: tuple[str, ...],
-    params: Filter.FilterParams,
+    params: quality_filters.FilterParams,
 ) -> str:
     parts = []
     for filter_name in enabled_filters:
@@ -50,7 +50,7 @@ def descriptor_from_csv(csv_path: str | Path) -> str:
 def filtered_descriptor(
     input_csv: str | Path,
     enabled_filters: tuple[str, ...],
-    params: Filter.FilterParams,
+    params: quality_filters.FilterParams,
 ) -> str:
     input_descriptor = descriptor_from_csv(input_csv)
     filters_descriptor = filter_tag(enabled_filters, params)
@@ -71,7 +71,7 @@ def normalize_phase3_steps(steps: Mapping[str, bool]) -> dict[str, bool]:
 
 def descriptor_from_steps(
     steps: Mapping[str, bool],
-    params: Filter.FilterParams,
+    params: quality_filters.FilterParams,
     ssim_threshold: float,
     phash_distance_threshold: int,
 ) -> str:

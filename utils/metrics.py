@@ -15,7 +15,7 @@ from sklearn.metrics import (
     recall_score,
 )
 
-import src.ModelTrain as ModelTrain
+import src.training as training
 from src.architecture import with_architecture_results_dir
 from utils.common import RESULTS_DIR, resolve_data_path
 
@@ -23,13 +23,13 @@ import warnings
 warnings.filterwarnings("ignore", message=".*torch.load.*weights_only=False.*")
 
 
-SUMMARY_ROWS = ["general", *ModelTrain.CLASS_NAMES]
+SUMMARY_ROWS = ["general", *training.CLASS_NAMES]
 SUMMARY_COLUMNS = ["accuracy", "mcc", "macro_f1", "precision", "recall"]
 METRIC_KEY_SEPARATOR = "::"
 
 
-def _clone_config(config: ModelTrain.TrainingConfig) -> ModelTrain.TrainingConfig:
-    return ModelTrain.TrainingConfig(
+def _clone_config(config: training.TrainingConfig) -> training.TrainingConfig:
+    return training.TrainingConfig(
         **{field.name: getattr(config, field.name) for field in fields(config)}
     )
 
@@ -43,7 +43,7 @@ def _load_model_weights(weights_path: Path, device: torch.device):
 
 def _resolve_random_states(
     results_dirs: Sequence[str | Path],
-    base_config: ModelTrain.TrainingConfig,
+    base_config: training.TrainingConfig,
     random_states: Sequence[int] | None,
 ) -> list[int]:
     if random_states is None:
@@ -80,7 +80,7 @@ def _general_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]
 def _class_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
     metrics: dict[str, float] = {}
 
-    for class_idx, class_name in enumerate(ModelTrain.CLASS_NAMES):
+    for class_idx, class_name in enumerate(training.CLASS_NAMES):
         class_true = y_true == class_idx
         class_pred = y_pred == class_idx
         metrics.update(
@@ -135,24 +135,24 @@ def _summarize_per_run_metrics(
 def _build_validation_loader(
     validation_csv_dir: str | Path,
     validation_img_dir: str | Path,
-    config: ModelTrain.TrainingConfig,
+    config: training.TrainingConfig,
     device: torch.device,
 ):
-    val_metadata_df = ModelTrain.load_training_metadata(validation_csv_dir)
-    _, val_transform = ModelTrain.build_transforms(config)
-    val_dataset = ModelTrain.PolypDataset(
+    val_metadata_df = training.load_training_metadata(validation_csv_dir)
+    _, val_transform = training.build_transforms(config)
+    val_dataset = training.PolypDataset(
         val_metadata_df,
         images_dir=resolve_data_path(validation_img_dir),
         transform=val_transform,
     )
-    return ModelTrain.build_validation_dataloader(val_dataset, config, device)
+    return training.build_validation_dataloader(val_dataset, config, device)
 
 
 def _evaluate_results_dir(
     results_dir: str | Path,
     validation_csv_dir: str | Path,
     validation_img_dir: str | Path,
-    config: ModelTrain.TrainingConfig,
+    config: training.TrainingConfig,
 ) -> dict[str, float | str]:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     architecture_results_dir = with_architecture_results_dir(
@@ -175,8 +175,8 @@ def _evaluate_results_dir(
         device=device,
     )
 
-    model = ModelTrain.PolypClassifier(
-        num_classes=len(ModelTrain.CLASS_NAMES),
+    model = training.PolypClassifier(
+        num_classes=len(training.CLASS_NAMES),
         dropout=config.dropout,
         stochastic_depth_prob=config.stochastic_depth_prob,
         architecture=config.architecture,
@@ -213,7 +213,7 @@ def print_results_metrics_summary(
     results_dirs: Sequence[str | Path],
     validation_csv_dir: str | Path,
     validation_img_dir: str | Path,
-    training_config: ModelTrain.TrainingConfig,
+    training_config: training.TrainingConfig,
     random_states: Sequence[int] | None = None,
 ) -> pd.DataFrame:
     if not results_dirs:
@@ -246,7 +246,7 @@ def collect_results_metrics(
     results_dirs: Sequence[str | Path],
     validation_csv_dir: str | Path,
     validation_img_dir: str | Path,
-    training_config: ModelTrain.TrainingConfig,
+    training_config: training.TrainingConfig,
     random_states: Sequence[int] | None = None,
 ) -> pd.DataFrame:
     if not results_dirs:

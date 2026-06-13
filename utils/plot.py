@@ -11,7 +11,7 @@ from sklearn.metrics import (
     f1_score,
 )
 
-import src.ModelTrain as ModelTrain
+import src.training as training
 from src.architecture import with_architecture_results_dir
 from src.experiment_runner import run_training_experiment
 from utils.common import RESULTS_DIR
@@ -104,7 +104,7 @@ def print_validation_metrics(trained_model, validation_loader):
     report_text = classification_report(
         all_labels,
         all_preds,
-        target_names=ModelTrain.CLASS_NAMES,
+        target_names=training.CLASS_NAMES,
         digits=4,
         zero_division=0,
     )

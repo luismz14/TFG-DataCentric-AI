@@ -6,11 +6,11 @@ from pathlib import Path
 
 import pandas as pd
 
-import src.TemporaryClean as TemporaryClean
+import src.phase3.deduplication_core as deduplication_core
 from src.phase3.config import PHASE3_DATA_DIR, PHASE3_IMAGES_DIR, PHASE3_SOURCE_CSV
 from src.phase3.naming import deduplication_tag, phase3_csv_path
 from utils.common import read_csv, resolve_data_path, write_csv
-from utils.phase3.deduplication import calculate_phase3_metrics
+from src.phase3.metrics import calculate_phase3_metrics
 
 
 def calculate_phase3_source_metrics(
@@ -48,7 +48,7 @@ def run_phase3_deduplication(
     )
     write_csv(metrics_df, metrics_input_path)
 
-    result = TemporaryClean.deduplication_handler(
+    result = deduplication_core.deduplication_handler(
         metadata_path=metrics_input_path,
         images_dir=resolve_data_path(images_dir),
         output_path=output_csv_path,

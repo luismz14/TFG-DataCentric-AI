@@ -8,8 +8,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-import src.Filters as Filter
-from utils.phase3.deduplication import calculate_phase3_metrics
+import src.quality_filters as quality_filters
+from src.phase3.metrics import calculate_phase3_metrics
 
 
 FILTER_ORDER = ("darkness", "uniformity", "blur")
@@ -24,7 +24,7 @@ def _validate_enabled_filters(enabled_filters: Sequence[str]) -> tuple[str, ...]
 
 
 def apply_quality_filters(
-    params: Filter.FilterParams,
+    params: quality_filters.FilterParams,
     dataframe_or_csv: pd.DataFrame | str | Path,
     enabled_filters: Sequence[str],
     images_dir: str | Path,

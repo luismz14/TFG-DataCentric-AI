@@ -6,7 +6,7 @@ import cv2
 import numpy as np
 import pandas as pd
 
-import src.Filters as Filter
+import src.quality_filters as quality_filters
 from utils.common import validate_required_columns
 
 
@@ -14,17 +14,17 @@ QUALITY_FILTER_SPECS = {
     "darkness": {
         "metric_column": "brightness_v_mean",
         "thresholds": [30.0, 35.0, 40.0, 45.0, 50.0],
-        "metric_builder": Filter.add_darkness_values,
+        "metric_builder": quality_filters.add_darkness_values,
     },
     "uniformity": {
         "metric_column": "uniformity_entropy",
         "thresholds": [5.75, 6.0, 6.25, 6.5, 6.75],
-        "metric_builder": Filter.add_uniformity_values,
+        "metric_builder": quality_filters.add_uniformity_values,
     },
     "blur": {
         "metric_column": "laplacian_variance",
         "thresholds": [15.0, 20.0, 25.0, 30.0, 35.0],
-        "metric_builder": Filter.add_blur_values,
+        "metric_builder": quality_filters.add_blur_values,
     },
 }
 

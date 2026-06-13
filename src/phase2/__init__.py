@@ -1,1 +1,1 @@
-"""Phase 2: video ingestion and baseline retraining."""
+"""Phase 2: video ingestion, dataset selection and retraining."""

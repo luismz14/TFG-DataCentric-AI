@@ -3,7 +3,7 @@
 from dataclasses import fields
 
 from src.architecture import EFFICIENTNET_B0
-from src.ModelTrain import TrainingConfig
+from src.training import TrainingConfig
 
 
 # This configuration is intentionally fixed across phases so metric changes can

@@ -8,7 +8,7 @@ from typing import Iterable, TypedDict
 
 import torch
 
-import src.ModelTrain as ModelTrain
+import src.training as training
 from src.architecture import with_architecture_results_dir
 from utils.common import RESULTS_DIR, resolve_data_path
 from utils.constants import VALIDATION_CSV, VALIDATION_IMAGES_DIR
@@ -22,8 +22,8 @@ class ExperimentRun(TypedDict):
     random_state: int
 
 
-def clone_training_config(config: ModelTrain.TrainingConfig) -> ModelTrain.TrainingConfig:
-    return ModelTrain.TrainingConfig(
+def clone_training_config(config: training.TrainingConfig) -> training.TrainingConfig:
+    return training.TrainingConfig(
         **{field.name: getattr(config, field.name) for field in fields(config)}
     )
 
@@ -36,26 +36,26 @@ def load_model_weights(weights_path: Path, device: torch.device):
 
 
 def build_fixed_validation_loader(
-    config: ModelTrain.TrainingConfig,
+    config: training.TrainingConfig,
     device: torch.device,
 ):
-    val_metadata_df = ModelTrain.load_training_metadata(VALIDATION_CSV)
-    _, val_transform = ModelTrain.build_transforms(config)
-    val_dataset = ModelTrain.PolypDataset(
+    val_metadata_df = training.load_training_metadata(VALIDATION_CSV)
+    _, val_transform = training.build_transforms(config)
+    val_dataset = training.PolypDataset(
         val_metadata_df,
         images_dir=resolve_data_path(VALIDATION_IMAGES_DIR),
         transform=val_transform,
     )
-    return ModelTrain.build_validation_dataloader(val_dataset, config, device)
+    return training.build_validation_dataloader(val_dataset, config, device)
 
 
 def run_training_experiment(
     train_csv: str | Path,
     train_images_dir: str | Path,
     results_dir: str | Path,
-    config: ModelTrain.TrainingConfig,
+    config: training.TrainingConfig,
     force_train: bool = False,
-) -> tuple[ModelTrain.PolypClassifier, torch.utils.data.DataLoader]:
+) -> tuple[training.PolypClassifier, torch.utils.data.DataLoader]:
     """Train or load one baseline experiment without showing notebook plots."""
 
     architecture_results_dir = with_architecture_results_dir(
@@ -73,7 +73,7 @@ def run_training_experiment(
     )
 
     if should_train:
-        return ModelTrain.train(
+        return training.train(
             train_csv_name=train_csv,
             validation_csv_name=VALIDATION_CSV,
             images_dir_name=train_images_dir,
@@ -83,8 +83,8 @@ def run_training_experiment(
         )
 
     print(f"Loading model located at: {best_model_weights_path}")
-    trained_model = ModelTrain.PolypClassifier(
-        num_classes=len(ModelTrain.CLASS_NAMES),
+    trained_model = training.PolypClassifier(
+        num_classes=len(training.CLASS_NAMES),
         dropout=config.dropout,
         stochastic_depth_prob=config.stochastic_depth_prob,
         architecture=config.architecture,
@@ -99,7 +99,7 @@ def run_training_experiments(
     runs: Iterable[ExperimentRun],
     train_csv: str | Path,
     train_images_dir: str | Path,
-    base_config: ModelTrain.TrainingConfig,
+    base_config: training.TrainingConfig,
     force_train: bool = False,
 ) -> None:
     """Run the same baseline recipe for all configured experiment seeds."""

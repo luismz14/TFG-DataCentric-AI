@@ -7,7 +7,7 @@ import cv2
 import matplotlib.pyplot as plt
 import pandas as pd
 
-import src.Filters as Filter
+import src.quality_filters as quality_filters
 from utils.common import read_csv
 
 
@@ -67,7 +67,7 @@ def calculate_phase3_metrics(
     dataframe = _ensure_metric_column(
         dataframe=dataframe,
         column_name="brightness_v_mean",
-        metric_builder=lambda df: Filter.add_darkness_values(
+        metric_builder=lambda df: quality_filters.add_darkness_values(
             df,
             images_dir=images_dir,
         ),
@@ -75,7 +75,7 @@ def calculate_phase3_metrics(
     dataframe = _ensure_metric_column(
         dataframe=dataframe,
         column_name="uniformity_entropy",
-        metric_builder=lambda df: Filter.add_uniformity_values(
+        metric_builder=lambda df: quality_filters.add_uniformity_values(
             df,
             images_dir=images_dir,
         ),
@@ -83,7 +83,7 @@ def calculate_phase3_metrics(
     dataframe = _ensure_metric_column(
         dataframe=dataframe,
         column_name="laplacian_variance",
-        metric_builder=lambda df: Filter.add_blur_values(
+        metric_builder=lambda df: quality_filters.add_blur_values(
             df,
             images_dir=images_dir,
         ),

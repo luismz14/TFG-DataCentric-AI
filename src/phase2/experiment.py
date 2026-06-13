@@ -7,9 +7,9 @@ from typing import Sequence
 
 import pandas as pd
 
-import src.ModelTrain as ModelTrain
+import src.training as training
 from src.architecture import with_architecture_results_dir
-from src.VideoIngestor import augment_dataset
+from src.phase2.video_ingestion import augment_dataset
 from src.baseline_config import BASELINE_CONFIG
 from src.experiment_reporting import print_experiment_summary
 from src.experiment_runner import run_training_experiments
@@ -26,7 +26,6 @@ from src.phase2.config import (
     PHASE2_RUNS,
     PHASE2_SOURCE_CSV,
     PHASE2_TARGET_FPS,
-    PHASE2_TRAIN_CONF040_THRESHOLD,
     PHASE2_TRAIN_CSV,
     PHASE2_WINDOW_SEC,
     PHASE2_YOLO_WEIGHTS,
@@ -84,12 +83,6 @@ def phase2_comparison_specs() -> tuple[Phase2ExperimentSpec, ...]:
             train_csv=PHASE2_FULL_TRAIN_CSV,
             images_dir=PHASE2_FRAMES_DIR,
             results_dir=Path("phase2") / "train",
-        ),
-        Phase2ExperimentSpec(
-            descriptor="train_conf040",
-            train_csv=PHASE2_TRAIN_CSV,
-            images_dir=PHASE2_FRAMES_DIR,
-            results_dir=Path("phase2") / "train_conf040",
         ),
         Phase2ExperimentSpec(
             descriptor=_phase2_confidence_tag(PHASE2_CONFIDENCE_ONLY_THRESHOLD),
@@ -164,47 +157,6 @@ def ingest_phase2_confidence_only_dataset(
         confidence_threshold=confidence_threshold,
         frames_dir=frames_dir,
     )
-
-
-def curate_phase2_train_conf040_dataset() -> dict[str, int | str | float]:
-    """Create the selected phase-2 dataset: originals + conf>=0.40 video frames."""
-    source_path = resolve_data_path(PHASE2_FULL_TRAIN_CSV)
-    output_path = resolve_data_path(PHASE2_TRAIN_CSV)
-    train_df = read_csv(source_path).copy()
-
-    required_columns = {"source_type", "detection_confidence"}
-    missing_columns = required_columns - set(train_df.columns)
-    if missing_columns:
-        raise ValueError(
-            f"Cannot curate phase-2 train_conf040 dataset; missing columns: "
-            f"{sorted(missing_columns)}"
-        )
-
-    train_df["detection_confidence"] = pd.to_numeric(
-        train_df["detection_confidence"],
-        errors="coerce",
-    ).fillna(0.0)
-    original_mask = train_df["source_type"].eq("original")
-    video_mask = (
-        train_df["source_type"].eq("video_candidate")
-        & train_df["detection_confidence"].ge(PHASE2_TRAIN_CONF040_THRESHOLD)
-    )
-    curated_df = train_df.loc[original_mask | video_mask].reset_index(drop=True)
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    curated_df.to_csv(output_path, index=False)
-
-    return {
-        "source_csv_path": str(source_path),
-        "output_csv_path": str(output_path),
-        "confidence_threshold": PHASE2_TRAIN_CONF040_THRESHOLD,
-        "total_rows": len(curated_df),
-        "original_rows": int(original_mask.sum()),
-        "video_rows": int(video_mask.sum()),
-        "dropped_video_rows": int(
-            train_df["source_type"].eq("video_candidate").sum() - video_mask.sum()
-        ),
-    }
 
 
 def print_phase2_train_summary(train_csv: str | Path = PHASE2_TRAIN_CSV) -> None:
@@ -308,7 +260,7 @@ def print_phase2_failure_summary(
 
 
 def _results_dirs_for_config(
-    training_config: ModelTrain.TrainingConfig,
+    training_config: training.TrainingConfig,
 ) -> list[dict]:
     return [
         {
@@ -324,7 +276,7 @@ def _results_dirs_for_config(
 
 def run_phase2_experiments(
     force_train: bool = False,
-    training_config: ModelTrain.TrainingConfig = BASELINE_CONFIG,
+    training_config: training.TrainingConfig = BASELINE_CONFIG,
 ) -> None:
     run_training_experiments(
         runs=PHASE2_RUNS,
@@ -337,7 +289,7 @@ def run_phase2_experiments(
 
 def run_phase2_confidence_only_experiments(
     force_train: bool = False,
-    training_config: ModelTrain.TrainingConfig = BASELINE_CONFIG,
+    training_config: training.TrainingConfig = BASELINE_CONFIG,
     confidence_threshold: float = PHASE2_CONFIDENCE_ONLY_THRESHOLD,
     train_images_dir: str | Path = PHASE2_CONFIDENCE_ONLY_FRAMES_DIR,
 ) -> None:
@@ -353,7 +305,7 @@ def run_phase2_confidence_only_experiments(
 def train_phase2_dataset(
     spec: Phase2ExperimentSpec,
     force_train: bool = False,
-    training_config: ModelTrain.TrainingConfig = BASELINE_CONFIG,
+    training_config: training.TrainingConfig = BASELINE_CONFIG,
     runs: Sequence[dict] = PHASE2_RUNS,
 ) -> str:
     run_training_experiments(
@@ -368,7 +320,7 @@ def train_phase2_dataset(
 
 def summarize_phase2_experiment_specs(
     specs: Sequence[Phase2ExperimentSpec],
-    training_config: ModelTrain.TrainingConfig = BASELINE_CONFIG,
+    training_config: training.TrainingConfig = BASELINE_CONFIG,
     runs: Sequence[dict] = PHASE2_RUNS,
 ) -> pd.DataFrame:
     rows = []
@@ -403,14 +355,14 @@ def summarize_phase2_experiment_specs(
 
 
 def show_phase2_plots(
-    training_config: ModelTrain.TrainingConfig = BASELINE_CONFIG,
+    training_config: training.TrainingConfig = BASELINE_CONFIG,
 ) -> None:
     for run in _results_dirs_for_config(training_config):
         show_training_plots(run["results_dir"])
 
 
 def show_phase2_confidence_only_plots(
-    training_config: ModelTrain.TrainingConfig = BASELINE_CONFIG,
+    training_config: training.TrainingConfig = BASELINE_CONFIG,
     confidence_threshold: float = PHASE2_CONFIDENCE_ONLY_THRESHOLD,
 ) -> None:
     for run in phase2_confidence_only_runs(confidence_threshold):
@@ -422,7 +374,7 @@ def show_phase2_confidence_only_plots(
 
 
 def print_phase2_summary(
-    training_config: ModelTrain.TrainingConfig = BASELINE_CONFIG,
+    training_config: training.TrainingConfig = BASELINE_CONFIG,
 ) -> pd.DataFrame:
     return print_experiment_summary(
         results_dirs=[run["results_dir"] for run in PHASE2_RUNS],
@@ -432,7 +384,7 @@ def print_phase2_summary(
 
 
 def print_phase2_confidence_only_summary(
-    training_config: ModelTrain.TrainingConfig = BASELINE_CONFIG,
+    training_config: training.TrainingConfig = BASELINE_CONFIG,
     confidence_threshold: float = PHASE2_CONFIDENCE_ONLY_THRESHOLD,
 ) -> pd.DataFrame:
     runs = phase2_confidence_only_runs(confidence_threshold)
