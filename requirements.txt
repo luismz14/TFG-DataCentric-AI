@@ -1,0 +1,16 @@
+dropbox
+ipython
+matplotlib
+numpy
+opencv-python
+pandas
+pillow
+python-dotenv
+scikit-image
+scikit-learn
+seaborn
+timm
+torch
+torchvision
+tqdm
+ultralytics

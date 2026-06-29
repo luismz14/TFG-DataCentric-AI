@@ -1,11 +1,13 @@
-# Entorno y configuración
+# Environment and local configuration
 .env
-.venv
-.vscode
+.venv/
+.vscode/
 .DS_Store
 
 # Python
 __pycache__/
+**/__pycache__/
+**pycache**/
 *.pyc
 *.pyo
 *.egg-info/
@@ -13,19 +15,28 @@ dist/
 build/
 .pytest_cache/
 
-# Jupyter Notebook
+# Jupyter
 .ipynb_checkpoints/
 
-# Datos y reportes
-data/patient_content/
-data/unified_images/
-data/phase2/frames/*
-data/phase2/framesv2/*
+# Data, reports, and generated outputs
+data/
+results/
+reports/
+files/
+advisor_reruns_student/
 
+# Model weights and serialized artifacts
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.npz
+*.joblib
+*.pickle
+*.pkl
 
-# Salida de LaTeX y compilaciones
+# LaTeX build outputs
 **/latexInformeFinal/%OUTDIR%/
-**/*.pdf
 **/*.aux
 **/*.bbl
 **/*.blg
@@ -49,17 +60,5 @@ data/phase2/framesv2/*
 **/*.nav
 **/*.vrb
 
-# Archivos específicos
-utils/Informe_final_ejemplo.pdf
-
 # Logs
 *.log
-
-data/test/external_tesT/
-data/images_cropped/
-reports/
-advisor_reruns_student/
-data/test/images_cropped/
-data/phase2/frames_confidence_only
-results/EfficientNet/phase3_test
-data/phase3test
