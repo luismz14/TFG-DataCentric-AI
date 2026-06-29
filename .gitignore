@@ -1,10 +1,17 @@
+# Local data and generated artifacts
+data/
+results/
+reports/
+files/
+
 # Environment and local configuration
 .env
+.env.*
 .venv/
 .vscode/
 .DS_Store
 
-# Python
+# Python and Jupyter caches
 __pycache__/
 **/__pycache__/
 **pycache**/
@@ -14,19 +21,11 @@ __pycache__/
 dist/
 build/
 .pytest_cache/
-
-# Jupyter
 .ipynb_checkpoints/
-
-# Data, reports, and generated outputs
-data/
-results/
-reports/
-files/
-advisor_reruns_student/
 
 # Model weights and serialized artifacts
 *.pt
+!utils/model/CVC_ClinicDB_yolov8m.pt
 *.pth
 *.ckpt
 *.onnx
@@ -34,31 +33,6 @@ advisor_reruns_student/
 *.joblib
 *.pickle
 *.pkl
-
-# LaTeX build outputs
-**/latexInformeFinal/%OUTDIR%/
-**/*.aux
-**/*.bbl
-**/*.blg
-**/*.out
-**/*.toc
-**/*.log
-**/*.synctex.gz
-**/*.fdb_latexmk
-**/*.fls
-**/*.lof
-**/*.lot
-**/*.dpth
-**/*.md5
-**/*.auxlock
-**/*.ilg
-**/*.ind
-**/*.idx
-**/*.spl
-**/*.navrc
-**/*.snm
-**/*.nav
-**/*.vrb
 
 # Logs
 *.log
