@@ -1,0 +1,54 @@
+# Local data and generated artifacts
+data/
+results/
+reports/
+files/
+
+# Environment and local configuration
+.env
+.env.*
+*.env
+.envrc
+.direnv/
+.venv/
+venv/
+env/
+.conda/
+.vscode/
+.idea/
+config.local.*
+config.private.*
+.secrets/
+.DS_Store
+
+# Dropbox inventories and temporary downloads
+dataset_inventory.json
+temp_workspace/
+*.part
+*.partial
+*.download
+
+# Python and Jupyter caches
+__pycache__/
+**/__pycache__/
+**pycache**/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Model weights and serialized artifacts
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.npz
+*.joblib
+*.pickle
+*.pkl
+
+# Logs
+*.log
