@@ -16,7 +16,7 @@ The four target histology classes are:
 ## Key Results
 
 - **EfficientNet-B0** achieved its best validation Macro-F1 with confidence-based ingestion: **0.5864** versus **0.5371** for the baseline, an approximately **+9.18% relative improvement**.
-- **ViT-Small** achieved its best validation Macro-F1 with final deduplication: **0.6233** versus **0.5949** for the baseline, an approximately **+4.77% relative improvement**.
+- **ViT-Small** achieved validation Macro-F1 with final deduplication: **0.6233** versus **0.5949** for the baseline, an approximately **+4.77% relative improvement**.
 - These validation improvements did **not consistently transfer to the external multicenter test set**, highlighting domain shift between the training and external evaluation domains.
 
 ## Problem and Data-Centric Approach
@@ -145,10 +145,12 @@ The following values are the final thesis results, reported as **mean Macro-F1 �
 | Configuration              | EfficientNet-B0 Validation | EfficientNet-B0 External Test | ViT-Small Validation | ViT-Small External Test |
 | -------------------------- | -------------------------- | ----------------------------- | -------------------- | ----------------------- |
 | Baseline                   | 0.5371 ± 0.0349           | 0.4911 ± 0.0056              | 0.5949 ± 0.0104     | 0.4816 ± 0.0123        |
-| Balanced ingestion         | 0.5674 ± 0.0059           | 0.5003 ± 0.0082              | 0.6196 ± 0.0087     | 0.4637 ± 0.0180        |
-| Deduplication (conf > 0.4) | 0.5713 ± 0.0105           | 0.5003 ± 0.0142              | 0.6160 ± 0.0103     | 0.4909 ± 0.0065        |
+| Confidence filtering (conf >= 0.4) | 0.5674 ± 0.0059           | 0.5003 ± 0.0082              | 0.6196 ± 0.0087     | 0.4637 ± 0.0180        |
+| Deduplication (conf >= 0.4) | 0.5713 ± 0.0105           | 0.5003 ± 0.0142              | 0.6160 ± 0.0103     | 0.4909 ± 0.0065        |
 | Confidence-based ingestion | 0.5864 ± 0.0100           | 0.4895 ± 0.0055              | 0.6179 ± 0.0032     | 0.4476 ± 0.0154        |
 | Final deduplication        | 0.5830 ± 0.0048           | 0.4917 ± 0.0098              | 0.6233 ± 0.0186     | 0.4653 ± 0.0184        |
+
+The table presents selected historical configurations. The [aggregate results summary](docs/results-summary.csv) preserves all six configurations in the archived summary, including the Phase 2 `train` branch. See [reproducibility and provenance notes](docs/reproducibility.md) for configuration mapping and an outstanding interpretation review.
 
 ### Interpretation
 
@@ -156,7 +158,7 @@ For **EfficientNet-B0**, final deduplication increases validation Macro-F1 from 
 
 The best EfficientNet-B0 validation result is obtained with **confidence-based ingestion**, reaching **0.5864**, approximately **+9.18% relative to baseline**.
 
-For **ViT-Small**, final deduplication increases validation Macro-F1 from **0.5949 to 0.6233**, approximately **+4.77% relative to baseline**, and represents the best ViT-Small validation configuration.
+For **ViT-Small**, final deduplication increases validation Macro-F1 from **0.5949 to 0.6233**, approximately **+4.77% relative to baseline**, within the selected configurations shown above.
 
 However, the external-test results do not show the same consistent improvement.
 
@@ -191,6 +193,7 @@ The multicenter external evaluation exposes a domain shift between the predomina
 |   `-- thresholds/              # Threshold-selection notebooks
 |
 |-- dropbox_utils/               # Optional remote dataset inventory/download helpers
+|-- docs/                        # Aggregate results and reproducibility notes
 |-- scripts/                     # Auxiliary scripts
 |-- requirements.txt             # Direct Python dependencies
 |-- .python-version              # Recommended Python version
@@ -302,140 +305,9 @@ The project source code is distributed under the MIT License included in [`LICEN
 
 Third-party software, pretrained models, datasets, and model checkpoints remain subject to their respective terms.
 
-The `CVC_ClinicDB_yolov8m.pt` detector is a separate third-party artifact and is not redistributed as part of this repositor
+The `CVC_ClinicDB_yolov8m.pt` detector is a separate third-party artifact and is not redistributed as part of this repository.
 
-# Improving Medical Diagnostic Models in Colonoscopy Through Data-Centric AI
 
-## Overview
+## Publication scope
 
-This repository contains the source code and experimentation notebooks for a Final Degree Project in Computer Science focused on Data-Centric AI for colonoscopy-based medical diagnosis. The project develops and evaluates a pipeline for improving multiclass polyp classification by acting on the training data, rather than relying on continuous changes to the model architecture.
-
-The experimental workflow uses EfficientNet-B0 and ViT-Small classifiers as baseline and comparison architectures. The repository is intended to document the complete project logic, experiment structure, and execution order while keeping clinical data and generated artifacts outside version control.
-
-## Pipeline
-
-- **Phase 0 - Dataset normalization and grouped split:** normalizes the clinical repository data, prepares the image metadata, crops the relevant regions, and creates a grouped train-validation split to reduce leakage between related samples.
-- **Phase 1 - Baseline model training:** trains the initial EfficientNet-B0 and ViT-Small classifiers on the normalized image dataset.
-- **Phase 2 - Video-based data ingestion:** expands the training data using colonoscopy videos, the included YOLO detector, and ByteTrack-based tracking.
-- **Phase 3 - Data curation and deduplication:** evaluates quality filtering strategies and temporal deduplication using SSIM and pHash to reduce redundant or low-quality samples.
-
-## Repository Structure
-
-```text
-.
-|-- src/                         # Core pipeline, training, phase logic, reporting, and curation code
-|-- phase0.ipynb                 # Dataset normalization and grouped split workflow
-|-- phase1.ipynb                 # EfficientNet-B0 Phase 1 baseline experiment
-|-- phase1ViT.ipynb              # ViT-Small Phase 1 baseline experiment
-|-- phase2.ipynb                 # EfficientNet-B0 Phase 2 video ingestion experiment
-|-- phase2ViT.ipynb              # ViT-Small Phase 2 video ingestion experiment
-|-- phase3.ipynb                 # EfficientNet-B0 Phase 3 curation experiment
-|-- phase3ViT.ipynb              # ViT-Small Phase 3 curation experiment
-|-- phase3_sweep.ipynb           # Phase 3 curation and filtering sweep
-|-- final_results.ipynb          # Analysis of generated experiment results
-|-- utils/                       # Shared utilities, metrics, plotting, and dataset helpers
-|-- utils/thresholds/            # Threshold exploration notebooks and helper modules
-|-- utils/model/                 # Local model/checkpoint files (not versioned)
-|-- dropbox_utils/               # Optional helpers for remote dataset inventory/download workflows
-|-- scripts/                     # Auxiliary figure-generation scripts
-|-- requirements.txt             # Python dependencies
-`-- LICENSE                     # Project license
-```
-
-## Included Resources
-
-The repository includes:
-
-- Python source code for the full pipeline;
-- experimentation notebooks for the main project phases;
-- configuration files and utility modules;
-- threshold-selection notebooks and helper modules;
-- the Phase 2 detector configuration and source reference;
-- dependency and documentation files.
-
-Phase 2 uses the third-party `CVC_ClinicDB_yolov8m.pt` detector from the
-[YOLO_SAM2 repository](https://github.com/sajjad-sh33/YOLO_SAM2/), at
-`YOLO_Checkpoints/CVC_ClinicDB_yolov8m.pt`. The binary is intentionally not
-redistributed in this repository. Place the checkpoint locally at
-`utils/model/CVC_ClinicDB_yolov8m.pt` before running Phase 2. 
-
-## Excluded Resources
-
-The repository does not include:
-
-- clinical images;
-- colonoscopy videos;
-- clinical CSVs or metadata;
-- generated results;
-- training figures;
-- EfficientNet-B0 or ViT-Small checkpoints.
-
-These exclusions are intentional because of clinical privacy, repository size, and the separation between source code and generated experiment artifacts.
-
-## Installation
-
-Create a Python virtual environment:
-
-```bash
-python -m venv .venv
-```
-
-Activate it on Windows PowerShell:
-
-```powershell
-.venv\Scripts\Activate.ps1
-```
-
-Or activate it on Unix systems:
-
-```bash
-source .venv/bin/activate
-```
-
-Install the required dependencies:
-
-```bash
-pip install -r requirements.txt
-```
-
-## Local Data and Execution Requirements
-
-The full pipeline requires local resources that are intentionally not versioned:
-
-- a `data/` directory containing the images, videos, CSVs, and metadata prepared according to the structure expected by the project;
-- a `results/` directory used as the destination for generated metrics, plots, checkpoints, and intermediate outputs;
-- a `.env` file only if the optional Dropbox utilities are used.
-
-The repository documents the complete experimental workflow, but it is not self-contained for full execution because the clinical data are not included.
-
-## Recommended Execution Order
-
-1. `phase0.ipynb`
-2. `phase1.ipynb` or `phase1ViT.ipynb`
-3. `phase2.ipynb` or `phase2ViT.ipynb`
-4. `phase3.ipynb`, `phase3ViT.ipynb`, or `phase3_sweep.ipynb`
-
-`final_results.ipynb` is intended for analyzing already generated results and requires `results/` to exist locally.
-
-## Expected Outputs
-
-When the required local data are available, the notebooks and Python modules generate experiment artifacts under `results/`, including:
-
-- trained classifier checkpoints;
-- training curves and confusion matrices;
-- per-run and aggregated metrics;
-- CSV summaries for phase comparisons and final analysis.
-
-These outputs are generated artifacts and are intentionally excluded from Git.
-
-## Academic Context
-
-- **Author:** Luis Martínez
-- **Supervisor:** Yael Tudela
-- **Institution:** UAB School of Engineering
-- **Academic year:** 2025-26
-- **Project type:** Final Degree Project in Computer Science
-
-## License
-
-This project is distributed under the terms of the license included in `LICENSE`.
+Clinical data and private/model artifacts are intentionally not distributed. Public results are aggregate historical evidence only; exact reproduction requires authorized private inputs. See [publication scope](docs/publication-scope.md) and [reproducibility](docs/reproducibility.md). The external archive and existing MIT source license are unchanged.

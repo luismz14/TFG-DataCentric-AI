@@ -133,7 +133,7 @@ def add_blur_values(
                 float(laplacian_values.var()) if laplacian_values.size else 0.0
             )
         else:
-            # Versión anterior con campo de visión central
+            # Historical variant computed entropy over the central field of view.
             height, width = gray_image.shape
             center = (width // 2, height // 2)
             radius = max(int(min(height, width) * 0.5 * fov_radius_ratio), 1)

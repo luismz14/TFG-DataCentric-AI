@@ -13,7 +13,8 @@ def analizar_dataset_completo(json_file):
         for patient in data:
             for file in patient['files']:
                 ext = file.get('extension', '.unknown').lower()
-                if ext == "": ext = "no_ext"
+                if ext == "":
+                    ext = "no_ext"
                 
                 ext_counter[ext] += 1
                 size_by_ext[ext] += file.get('size_mb', 0)

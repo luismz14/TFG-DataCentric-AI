@@ -3,7 +3,7 @@ import json
 import dropbox
 from dotenv import load_dotenv
 
-# Cargar configuración
+# Load local Dropbox configuration.
 load_dotenv()
 TOKEN = os.getenv('DROPBOX_TOKEN')
 URL = os.getenv('DROPBOX_URL')

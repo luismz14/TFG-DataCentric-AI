@@ -828,7 +828,7 @@ class VideoIngestor:
         track_store: dict[int, dict] = {}
         frame_cache: dict[int, object] = {}
 
-        # Importante: mantenemos independencia entre timestamps.
+        # Reset tracking state so annotated timestamps are processed independently.
         self.detector.predictor = None
 
         sampled_index_set = set(sampled_indices)
@@ -1748,7 +1748,7 @@ def augment_dataset(
                     pending_downloads.pop(completed_future)
                     downloaded_group = completed_future.result()
 
-                    # En cuanto se completa una descarga, lanzamos otra para mantener la recámara llena.
+                    # Start another download as soon as one finishes to keep the prefetch queue full.
                     schedule_next_download()
 
                     video_key = downloaded_group["video_key"]

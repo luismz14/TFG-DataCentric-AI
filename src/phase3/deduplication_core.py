@@ -326,7 +326,7 @@ def compute_phash(image: np.ndarray) -> np.ndarray:
     dct = cv2.dct(np.float32(resized))
     dct_low_freq = dct[:hash_size, :hash_size]
 
-    # The first DCT value is global brightness, so it is excluded.
+    # Exclude global brightness from the median; the returned hash retains its bit.
     dct_values = dct_low_freq.flatten()
     median = np.median(dct_values[1:])
 

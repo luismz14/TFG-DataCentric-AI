@@ -83,6 +83,7 @@ def unifyExcels(
     base_path: str | Path = PATIENT_CONTENT_DIR,
     output_path: str | Path = UNIFIED_METADATA_CSV,
 ) -> pd.DataFrame | None:
+    """Aggregate valid sessions, logging and skipping malformed input CSVs."""
     base_path = Path(base_path)
     output_path = Path(output_path)
     all_dfs = []
@@ -117,6 +118,7 @@ def unifyImages(
     src_base: str | Path = PATIENT_CONTENT_DIR,
     dst_dir: str | Path = UNIFIED_IMAGES_DIR,
 ) -> None:
+    """Flatten patient image folders; existing destination basenames are overwritten."""
     src_base = Path(src_base)
     dst_dir = Path(dst_dir)
 

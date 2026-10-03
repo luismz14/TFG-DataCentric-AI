@@ -51,7 +51,6 @@ TRAINING_REQUIRED_COLUMNS = ["histology", "filename"]
 # Configuration
 # ---------------------------------------------------------------------------
 
-# Slot = True is used to reduce memory and speed up attribute access.
 @dataclass(slots=True)
 class TrainingConfig:
     """Training hyperparameters fixed across the data-centric experiments."""
@@ -130,6 +129,7 @@ def set_random_seed(seed: int) -> None:
 
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
 
 def get_class_counts(dataframe: pd.DataFrame) -> pd.Series:
     """Return class counts ordered exactly as `CLASS_NAMES`."""
@@ -948,8 +948,8 @@ def train(
     )
 
     plot_and_save_learning_rates(
-    history_lr,
-    save_dir=save_dir,
+        history_lr,
+        save_dir=save_dir,
     )
 
     return model, val_loader
